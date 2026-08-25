@@ -49,6 +49,7 @@
 #include <QtWidgets/QFormLayout>
 #include <QtWidgets/QGroupBox>
 #include <QtWidgets/QGraphicsObject>
+#include <QtWidgets/QItemDelegate>
 #include <QtWidgets/QGraphicsScene>
 #include <QtWidgets/QGraphicsView>
 #include <QtWidgets/QHeaderView>
@@ -70,6 +71,7 @@
 
 #include <windows.h>
 #include <intrin.h>
+#include <psapi.h>
 
 #include <typeinfo>
 #include <vector>
@@ -235,15 +237,6 @@ constexpr int kComboSourceRole = Qt::UserRole + 0x4A0;
 // One Qt6 delegate serves both Painter and Designer. Designer-only features
 // (graph-view painting hooks, Designer resource widgets) are always compiled
 // in but only activated when the host process is Designer.
-bool isDesignerHost() {
-    const QString filePath =
-        QCoreApplication::applicationFilePath().toLower();
-    if (filePath.contains(QStringLiteral("designer")))
-        return true;
-    const QString appName =
-        QCoreApplication::applicationName().toLower();
-    return appName.contains(QStringLiteral("designer"));
-}
 
 void translateWidget(QWidget *widget);
 QString controlUniqueId(QWidget *widget, const QString &sourceText);
@@ -756,6 +749,47 @@ private:
     QAbstractItemView *view_ = nullptr;
 };
 
+// Painter 的下拉框（QComboBoxListView）默认用 QItemDelegate，其文本经
+// QTextLayout::draw 绘制，drawText 钩子覆盖不到。继承 QItemDelegate 并只
+// 覆写 drawDisplay()：绘制逻辑（含 Painter 对 section_title 分组的处理）完全
+// 沿用 QItemDelegate，仅在画前把非分组文本翻译，样式与 Painter 原生一致。
+class ComboItemDelegate final : public QItemDelegate {
+public:
+    explicit ComboItemDelegate(QAbstractItemView *view, QComboBox *combo)
+        : QItemDelegate(view), combo_(combo) {}
+
+    void drawDisplay(QPainter *painter, const QStyleOptionViewItem &option,
+                     const QRect &rect, const QString &text) const override {
+        const QModelIndex index = option.index;
+        const QString section = index.isValid()
+            ? index.data(Qt::AccessibleDescriptionRole).toString()
+            : QString();
+        // 分组标题（section_title）：保留原文，复刻 Painter 的画法——
+        // 设斜体并强制正常前景色（Painter 用它自己的 delegate 画斜体分组标题）。
+        if (section == QLatin1String("section_title")) {
+            QStyleOptionViewItem opt = option;
+            opt.state |= QStyle::State_Enabled;   // 避免 disabled 灰字
+            QFont font = opt.font;
+            font.setItalic(true);
+            opt.font = font;
+            QItemDelegate::drawDisplay(painter, opt, rect, text);
+            return;
+        }
+        // 普通子项：翻译后画。
+        QString display = text;
+        if (g_enabled && !text.isEmpty() && !containsCjk(text)) {
+            const QString result = translated(text, false,
+                                              translationControlId(combo_, text));
+            if (!result.isNull())
+                display = result;
+        }
+        QItemDelegate::drawDisplay(painter, option, rect, display);
+    }
+
+private:
+    QComboBox *combo_ = nullptr;
+};
+
 struct DelegateBinding {
     QPointer<QAbstractItemView> view;
     QPointer<QAbstractItemDelegate> original;
@@ -767,6 +801,52 @@ struct DelegateBinding {
 };
 
 std::vector<DelegateBinding> g_delegateBindings;
+
+struct ComboDelegateBinding {
+    QPointer<QAbstractItemView> view;
+    QPointer<QAbstractItemDelegate> original;
+    QPointer<ComboItemDelegate> installed;
+};
+
+std::vector<ComboDelegateBinding> g_comboDelegateBindings;
+
+int installComboReadDelegate(QComboBox *combo) {
+    if (!combo)
+        return 0;
+    QAbstractItemView *view = combo->view();
+    if (!view)
+        return 0;
+    if (dynamic_cast<ComboItemDelegate *>(view->itemDelegate())) {
+        view->viewport()->update();
+        return 2;
+    }
+    ComboDelegateBinding binding;
+    binding.view = view;
+    binding.original = view->itemDelegate();
+    auto *delegate = new ComboItemDelegate(view, combo);
+    binding.installed = delegate;
+    g_comboDelegateBindings.push_back(binding);
+    view->setItemDelegate(delegate);
+    view->viewport()->update();
+    return 1;
+}
+
+void restoreComboDelegates() {
+    for (auto it = g_comboDelegateBindings.rbegin();
+         it != g_comboDelegateBindings.rend(); ++it) {
+        QAbstractItemView *view = it->view.data();
+        ComboItemDelegate *installed = it->installed.data();
+        if (view) {
+            const bool stillInstalled = view->itemDelegate() == installed;
+            if (stillInstalled)
+                view->setItemDelegate(it->original.data());
+            if (view->viewport())
+                view->viewport()->update();
+        }
+        delete installed;
+    }
+    g_comboDelegateBindings.clear();
+}
 
 int installAssetDelegate(QAbstractItemView *view, bool compactGrid = false,
                          bool layersPanel = false) {
@@ -1569,22 +1649,133 @@ QString graphPaintTranslation(QPainter *painter, const QString &source,
     return target;
 }
 
+// ---------------------------------------------------------------------------
+// 通用绘制层翻译(纯显示层,样式无关)。
+// 在 QPainter::drawText 处翻译任何 UI 文本。此时拿到的是控件传给 drawText 的
+// 完整文本(QStyle::drawItemText / QCommonStyle::drawControl 会把控件全文传进来),
+// 与当前 QStyle 是 QCommonStyle/Fusion/自定义无关——因此**不需要替换 QStyle**,
+// 也就不存在"换 QCommonStyle 破坏外观"的问题。
+// 原文恢复按 SpeedTree 逻辑:只读控件自身的 text()/父控件 text 属性
+// (Alg::ElidedLabel),绝不写 kSourceProperty 缓存。
+// 仅当非节点图绘制时进入此处(节点图由 graphPaintTranslation 先行处理)。
+// ---------------------------------------------------------------------------
+QString generalPainterTranslation(QPainter *painter, const QString &text) {
+    if (!g_enabled)
+        return {};
+    if (text.isEmpty())
+        return {};
+    const QString trimmed = text.trimmed();
+    if (trimmed.size() <= 1)
+        return {};
+    if (containsCjk(trimmed))
+        return {};
+
+    // 临时诊断：记录 drawText 钩子收到的文本（去重），确认 Painter 下拉项
+    // 是否经过 drawText 钩子。仅供调试，验证后删除。
+    {
+        static QSet<QString> g_drawTextSeen;
+        QString deviceClass;
+        if (painter) {
+            if (QWidget *w = dynamic_cast<QWidget *>(painter->device()))
+                deviceClass = QString::fromLatin1(w->metaObject()->className());
+        }
+        const QString key = deviceClass + QChar(0x01) + trimmed;
+        if (!g_drawTextSeen.contains(key)) {
+            g_drawTextSeen.insert(key);
+            QFile out(QDir::temp().filePath(QStringLiteral("sp_drawtext_log.txt")));
+            if (out.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+                QTextStream stream(&out);
+                stream << deviceClass << " | " << trimmed << "\n";
+            }
+        }
+    }
+
+    // 廉价过滤:纯数值/单位数值几乎不可能是 UI 标签。
+    {
+        bool allValue = true;
+        for (QChar ch : trimmed) {
+            if (ch.isDigit() || ch == QLatin1Char('.') || ch == QLatin1Char(',') ||
+                ch == QLatin1Char('%') || ch == QLatin1Char('-') ||
+                ch == QLatin1Char('+') || ch == QLatin1Char('e') ||
+                ch == QLatin1Char('E') || ch == QLatin1Char(' '))
+                continue;
+            allValue = false;
+            break;
+        }
+        if (allValue)
+            return {};
+    }
+
+    // 从正在绘制的控件恢复完整原文(SpeedTree 逻辑):普通 QLabel 的 text() 就是
+    // 全文;Alg::ElidedLabel 把截断串塞给子 QLabel,全文在父控件的 text 属性里。
+    if (QWidget *device = dynamic_cast<QWidget *>(painter->device())) {
+        if (auto *lbl = qobject_cast<QLabel *>(device)) {
+            const QString displayed = lbl->text().trimmed();
+            const QString full = sourceFromPainterElidedLabel(lbl, displayed);
+            const QString source = full.isEmpty() ? displayed : full;
+            if (!source.isEmpty() && source != text) {
+                const QString fullTr =
+                    translated(source, false, translationControlId(lbl, source));
+                if (!fullTr.isEmpty())
+                    return fullTr;
+            }
+        }
+    }
+
+    // 直接精确/全局查词。
+    const QString target = translated(trimmed, false, QString());
+    if (!target.isEmpty())
+        return target;
+
+    // 省略前缀恢复:被截断的 "Mater…" 匹配词库里以 "Mater" 开头的最短原文。
+    // 先用线性遍历(省略绘制不常见);后续可换成 g_sortedKeys + 二分以省耗时。
+    if (text.endsWith(QChar(0x2026)) || text.endsWith(QLatin1String("..."))) {
+        QString base = text;
+        base.chop(text.endsWith(QChar(0x2026)) ? 1 : 3);
+        base = base.trimmed();
+        if (base.size() >= 2) {
+            const QString baseLower = base.toCaseFolded();
+            QString best;
+            for (auto it = g_translations.cbegin(); it != g_translations.cend(); ++it) {
+                const QString &key = it.key();
+                if (key.toCaseFolded().startsWith(baseLower) &&
+                    (best.isEmpty() || key.size() < best.size()))
+                    best = key;
+            }
+            if (!best.isEmpty()) {
+                const QString preTr = translated(best, false, QString());
+                if (!preTr.isEmpty())
+                    return preTr;
+            }
+        }
+    }
+    return {};
+}
+
 using DrawPoint = void (*)(QPainter *, const QPoint &, const QString &);
 using DrawPointF = void (*)(QPainter *, const QPointF &, const QString &);
 using DrawRect = void (*)(QPainter *, const QRect &, int, const QString &,
                           QRect *);
 using DrawRectFOption = void (*)(QPainter *, const QRectF &, const QString &,
                                  const QTextOption &);
+using DrawRectFAlign = void (*)(QPainter *, const QRectF &, int,
+                                const QString &, QRectF *);
 using DrawXY = void (*)(QPainter *, int, int, const QString &);
 using DrawXYWH = void (*)(QPainter *, int, int, int, int, int,
                           const QString &, QRect *);
+using DrawPointF2 = void (*)(QPainter *, const QPointF &, const QString &,
+                             int, int);
+using SetFont = void (*)(QPainter *, const QFont &);
 
 DrawPoint g_drawPoint = nullptr;
 DrawPointF g_drawPointF = nullptr;
 DrawRect g_drawRect = nullptr;
 DrawRectFOption g_drawRectFOption = nullptr;
+DrawRectFAlign g_drawRectFAlign = nullptr;
 DrawXY g_drawXY = nullptr;
 DrawXYWH g_drawXYWH = nullptr;
+DrawPointF2 g_drawPointF2 = nullptr;
+SetFont g_setFont = nullptr;
 bool g_graphPainterHooksInstalled = false;
 QSet<QString> g_graphPaintDiagnosticKeys;
 struct GraphHookSlot {
@@ -1724,7 +1915,9 @@ void hookedDrawPoint(QPainter *painter, const QPoint &point,
     recordGraphPaintType(painter, text, "QPoint",
                          reinterpret_cast<quintptr>(_ReturnAddress()));
 #endif
-    const QString target = graphPaintTranslation(painter, text);
+    QString target = graphPaintTranslation(painter, text);
+    if (target.isEmpty())
+        target = generalPainterTranslation(painter, text);
     g_drawPoint(painter, point, target.isEmpty() ? text : target);
 }
 
@@ -1734,8 +1927,53 @@ void hookedDrawPointF(QPainter *painter, const QPointF &point,
     recordGraphPaintType(painter, text, "QPointF",
                          reinterpret_cast<quintptr>(_ReturnAddress()));
 #endif
-    const QString target = graphPaintTranslation(painter, text);
+    QString target = graphPaintTranslation(painter, text);
+    if (target.isEmpty())
+        target = generalPainterTranslation(painter, text);
     g_drawPointF(painter, point, target.isEmpty() ? text : target);
+}
+
+void hookedDrawPointF2(QPainter *painter, const QPointF &point,
+                       const QString &text, int flags, int justification) {
+#if defined(SD_TRANSLATION_GRAPH_DIAGNOSTICS)
+    recordGraphPaintType(painter, text, "QPointF/Justify",
+                         reinterpret_cast<quintptr>(_ReturnAddress()), flags);
+#endif
+    QString target = graphPaintTranslation(painter, text);
+    if (target.isEmpty())
+        target = generalPainterTranslation(painter, text);
+    g_drawPointF2(painter, point, target.isEmpty() ? text : target,
+                  flags, justification);
+}
+
+void hookedSetFont(QPainter *painter, const QFont &font) {
+    // 临时诊断：记录 Painter 画下拉框项时所设的字体（斜体/点大小），
+    // 用于确认 section_title 分组标题的渲染。仅供调试，验证后删除。
+    if (painter) {
+        if (QWidget *w = dynamic_cast<QWidget *>(painter->device())) {
+            const QString cls = QString::fromLatin1(w->metaObject()->className());
+            if (cls == QLatin1String("QComboBoxListView")) {
+                static QSet<QString> seen;
+                const QString key = QStringLiteral("%1|%2|%3|%4")
+                    .arg(font.family())
+                    .arg(font.pointSizeF())
+                    .arg(font.italic() ? 1 : 0)
+                    .arg(font.weight());
+                if (!seen.contains(key)) {
+                    seen.insert(key);
+                    QFile out(QDir::temp().filePath(QStringLiteral("sp_setfont_log.txt")));
+                    if (out.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+                        QTextStream stream(&out);
+                        stream << "family=" << font.family()
+                               << " pt=" << font.pointSizeF()
+                               << " italic=" << font.italic()
+                               << " weight=" << font.weight() << "\n";
+                    }
+                }
+            }
+        }
+    }
+    g_setFont(painter, font);
 }
 
 void hookedDrawRect(QPainter *painter, const QRect &rect, int flags,
@@ -1744,7 +1982,9 @@ void hookedDrawRect(QPainter *painter, const QRect &rect, int flags,
     recordGraphPaintType(painter, text, "QRect",
                          reinterpret_cast<quintptr>(_ReturnAddress()), flags);
 #endif
-    const QString target = graphPaintTranslation(painter, text);
+    QString target = graphPaintTranslation(painter, text);
+    if (target.isEmpty())
+        target = generalPainterTranslation(painter, text);
     g_drawRect(painter, rect, flags, target.isEmpty() ? text : target,
                boundingRect);
 }
@@ -1759,7 +1999,9 @@ void hookedDrawRectFOption(QPainter *painter, const QRectF &rect,
                              (int(option.textDirection()) << 16));
 #endif
     const int portSide = graphPortLabelSide(painter, rect);
-    const QString target = graphPaintTranslation(painter, text, portSide);
+    QString target = graphPaintTranslation(painter, text, portSide);
+    if (target.isEmpty() && portSide == 0)
+        target = generalPainterTranslation(painter, text);
     if (target.isEmpty()) {
         g_drawRectFOption(painter, rect, text, option);
         return;
@@ -1775,12 +2017,37 @@ void hookedDrawRectFOption(QPainter *painter, const QRectF &rect,
     g_drawRectFOption(painter, rect, target, drawOption);
 }
 
+void hookedDrawRectFAlign(QPainter *painter, const QRectF &rect, int flags,
+                          const QString &text, QRectF *boundingRect) {
+#if defined(SD_TRANSLATION_GRAPH_DIAGNOSTICS)
+    recordGraphPaintType(painter, text, "QRectF/Align",
+                         reinterpret_cast<quintptr>(_ReturnAddress()), flags);
+#endif
+    const int portSide = graphPortLabelSide(painter, rect);
+    QString target = graphPaintTranslation(painter, text, portSide);
+    if (target.isEmpty() && portSide == 0)
+        target = generalPainterTranslation(painter, text);
+    if (target.isEmpty()) {
+        g_drawRectFAlign(painter, rect, flags, text, boundingRect);
+        return;
+    }
+    if (portSide == 0) {
+        g_drawRectFAlign(painter, rect, flags, target, boundingRect);
+        return;
+    }
+    const Qt::Alignment adjusted =
+        graphPortLabelAlignment(Qt::Alignment(flags), portSide);
+    g_drawRectFAlign(painter, rect, int(adjusted), target, boundingRect);
+}
+
 void hookedDrawXY(QPainter *painter, int x, int y, const QString &text) {
 #if defined(SD_TRANSLATION_GRAPH_DIAGNOSTICS)
     recordGraphPaintType(painter, text, "XY",
                          reinterpret_cast<quintptr>(_ReturnAddress()));
 #endif
-    const QString target = graphPaintTranslation(painter, text);
+    QString target = graphPaintTranslation(painter, text);
+    if (target.isEmpty())
+        target = generalPainterTranslation(painter, text);
     g_drawXY(painter, x, y, target.isEmpty() ? text : target);
 }
 
@@ -1790,18 +2057,20 @@ void hookedDrawXYWH(QPainter *painter, int x, int y, int width, int height,
     recordGraphPaintType(painter, text, "XYWH",
                          reinterpret_cast<quintptr>(_ReturnAddress()), flags);
 #endif
-    const QString target = graphPaintTranslation(painter, text);
+    QString target = graphPaintTranslation(painter, text);
+    if (target.isEmpty())
+        target = generalPainterTranslation(painter, text);
     g_drawXYWH(painter, x, y, width, height, flags,
                target.isEmpty() ? text : target, boundingRect);
 }
 
-bool replaceMainModuleImportInto(std::vector<GraphHookSlot> &slotList,
-                                 void *original, void *replacement) {
-    if (!original || !replacement)
+// 在 *任意* 模块的导入表里,把所有指向 `original` 的槽替换为 `replacement`
+// (SpeedTree 的文案:patch every import slot in `module` that points at `original`)。
+bool replaceImportInModule(HMODULE module, std::vector<GraphHookSlot> &slotList,
+                           void *original, void *replacement) {
+    if (!module || !original || !replacement)
         return false;
-    auto *base = reinterpret_cast<unsigned char *>(GetModuleHandleW(nullptr));
-    if (!base)
-        return false;
+    auto *base = reinterpret_cast<unsigned char *>(module);
     auto *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(base);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE)
         return false;
@@ -1842,9 +2111,23 @@ bool replaceMainModuleImportInto(std::vector<GraphHookSlot> &slotList,
     return replaced;
 }
 
-bool replaceMainModuleImport(void *original, void *replacement) {
-    return replaceMainModuleImportInto(g_graphHookSlots, original,
-                                       replacement);
+// 扫 *全部* 已加载模块,逐个 patch IAT。这样 QtWidgets.dll 里
+// QStyle::drawItemText -> QPainter::drawText 的调用(在 QtWidgets.dll 的导入表里)
+// 也能被拦截;而旧的 replaceMainModuleImportInto 只改宿主主 exe,拦不到它。
+bool replaceImportAllModules(std::vector<GraphHookSlot> &slotList,
+                             void *original, void *replacement) {
+    bool any = false;
+    HMODULE modules[2048];
+    DWORD needed = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules),
+                            &needed))
+        return false;
+    const DWORD count = needed / sizeof(HMODULE);
+    for (DWORD i = 0; i < count; ++i) {
+        if (replaceImportInModule(modules[i], slotList, original, replacement))
+            any = true;
+    }
+    return any;
 }
 
 bool restoreImportHooks(std::vector<GraphHookSlot> &slotList) {
@@ -1874,41 +2157,19 @@ bool uninstallGraphPainterHooks() {
     return !g_graphPainterHooksInstalled;
 }
 
-int designerExecutableMajorVersion() {
-    wchar_t executable[MAX_PATH] = {};
-    if (!GetModuleFileNameW(nullptr, executable, MAX_PATH))
-        return 0;
-    DWORD ignored = 0;
-    const DWORD size = GetFileVersionInfoSizeW(executable, &ignored);
-    if (!size)
-        return 0;
-    std::vector<unsigned char> data(size);
-    if (!GetFileVersionInfoW(executable, 0, size, data.data()))
-        return 0;
-    VS_FIXEDFILEINFO *info = nullptr;
-    UINT infoSize = 0;
-    if (!VerQueryValueW(data.data(), L"\\",
-                        reinterpret_cast<void **>(&info), &infoSize) ||
-        !info || infoSize < sizeof(VS_FIXEDFILEINFO) ||
-        info->dwSignature != 0xfeef04bd)
-        return 0;
-    return HIWORD(info->dwFileVersionMS);
-}
-
 bool graphHookEnvironmentCompatible() {
-    if (!isDesignerHost() || sizeof(void *) != 8)
+    // Painter 与 Designer 同属 Qt6 宿主,不再区分;只要求 64 位 + Qt6。
+    // 幂等:drawText 的 MSVC mangled 名在 Qt6.x 内稳定。
+    if constexpr (sizeof(void *) != 8)
         return false;
     const QStringList qtParts = QString::fromLatin1(qVersion()).split(u'.');
     if (qtParts.size() < 2)
         return false;
     bool majorOk = false;
-    bool minorOk = false;
     const int qtMajor = qtParts.at(0).toInt(&majorOk);
-    const int qtMinor = qtParts.at(1).toInt(&minorOk);
-    if (!majorOk || !minorOk || qtMajor != 6 || qtMinor < 5 || qtMinor > 9)
+    if (!majorOk || qtMajor != 6)
         return false;
-    const int designerMajor = designerExecutableMajorVersion();
-    return designerMajor == 15 || designerMajor == 16;
+    return true;
 }
 
 template <typename Function>
@@ -1916,7 +2177,7 @@ bool hookModuleImportForSlots(std::vector<GraphHookSlot> &slotList,
                               HMODULE module, const char *symbol,
                               Function hook, Function &original) {
     original = reinterpret_cast<Function>(GetProcAddress(module, symbol));
-    return original && replaceMainModuleImportInto(
+    return original && replaceImportAllModules(
         slotList, reinterpret_cast<void *>(original),
         reinterpret_cast<void *>(hook));
 }
@@ -1944,6 +2205,9 @@ bool installGraphPainterHooks() {
         qtGui, "?drawText@QPainter@@QEAAXAEBVQPointF@@AEBVQString@@@Z",
         &hookedDrawPointF, g_drawPointF);
     installed |= hookQtGuiImport(
+        qtGui, "?drawText@QPainter@@QEAAXAEBVQPointF@@AEBVQString@@HH@Z",
+        &hookedDrawPointF2, g_drawPointF2);
+    installed |= hookQtGuiImport(
         qtGui,
         "?drawText@QPainter@@QEAAXAEBVQRect@@HAEBVQString@@PEAV2@@Z",
         &hookedDrawRect, g_drawRect);
@@ -1952,12 +2216,19 @@ bool installGraphPainterHooks() {
         "?drawText@QPainter@@QEAAXAEBVQRectF@@AEBVQString@@AEBVQTextOption@@@Z",
         &hookedDrawRectFOption, g_drawRectFOption);
     installed |= hookQtGuiImport(
+        qtGui,
+        "?drawText@QPainter@@QEAAXAEBVQRectF@@HAEBVQString@@PEAV2@@Z",
+        &hookedDrawRectFAlign, g_drawRectFAlign);
+    installed |= hookQtGuiImport(
         qtGui, "?drawText@QPainter@@QEAAXHHAEBVQString@@@Z",
         &hookedDrawXY, g_drawXY);
     installed |= hookQtGuiImport(
         qtGui,
         "?drawText@QPainter@@QEAAXHHHHHAEBVQString@@PEAVQRect@@@Z",
         &hookedDrawXYWH, g_drawXYWH);
+    installed |= hookQtGuiImport(
+        qtGui, "?setFont@QPainter@@QEAAXAEBVQFont@@@Z",
+        &hookedSetFont, g_setFont);
     if (!installed || g_graphHookSlots.empty()) {
         uninstallGraphPainterHooks();
         return false;
@@ -2343,215 +2614,53 @@ bool injectAssetTranslationIntoPreview(QWidget *widget,
     return injected;
 }
 
-void translateMenu(QMenu *menu) {
-    if (!menu || !g_enabled)
-        return;
-    const bool layerBlendMode = isLayerBlendModeMenu(menu);
-    for (QAction *action : menu->actions()) {
-        const QString stored = action->property(kSourceProperty).toString();
-        const QString source = layerBlendMode && !stored.isEmpty()
-            ? stored : actionSource(action);
-        const QString result = translated(source, true,
-                                          translationControlId(menu, source));
-        if (!result.isNull() && action->text() != result) {
-            action->setProperty(kSourceProperty, source);
-            action->setText(result);
-        }
-    }
-}
-
-void translateMenuBar(QMenuBar *menuBar) {
-    if (!menuBar || !g_enabled)
-        return;
-    for (QAction *action : menuBar->actions()) {
-        const QString source = actionSource(action);
-        const QString result = translated(source, true,
-                                          translationControlId(menuBar, source));
-        if (!result.isNull() && action->text() != result) {
-            action->setProperty(kSourceProperty, source);
-            action->setText(result);
-        }
-    }
-}
-
 void translateWidget(QWidget *widget) {
     if (!widget || !g_enabled)
         return;
 
-    // QToolTip is implemented as a temporary QLabel (QTipLabel). Never feed
-    // tooltip contents back through the UI translator: these strings are the
-    // deliberately preserved English originals.
+    // 纯显示层：文本永存控件原文，翻译只发生在绘制层
+    // （QPainter::drawText 钩子 generalPainterTranslation 与显示层 delegate）。
+    // 这里只保留“安装显示层 delegate”这一项必要工作，普通控件的
+    // 文字不再 setText/setTitle/setPlaceholderText，避免改写原文。
     if (widget->windowType() == Qt::ToolTip ||
         QString::fromLatin1(widget->metaObject()->className()) == QStringLiteral("QTipLabel") ||
         (widget->window() && widget->window()->windowType() == Qt::ToolTip))
         return;
 
-    // The application-wide event filter sees every Painter widget. Reject
-    // types that this plugin never translates before walking their parent
-    // hierarchy; this removes most work from frequent paint/layout events.
-    const bool supportedType =
-        qobject_cast<QAbstractItemView *>(widget) ||
-        qobject_cast<QMenu *>(widget) ||
-        qobject_cast<QMenuBar *>(widget) ||
-        qobject_cast<QAbstractButton *>(widget) ||
-        qobject_cast<QLabel *>(widget) ||
-        qobject_cast<QGroupBox *>(widget) ||
-        qobject_cast<QComboBox *>(widget) ||
-        qobject_cast<QTabBar *>(widget) ||
-        qobject_cast<QDockWidget *>(widget) ||
-        qobject_cast<QLineEdit *>(widget);
-    if (!supportedType || shouldExcludeLayersPanel(widget))
-        return;
-
-    // Painter's Assets search is owned by the same NewResourcesView as its
-    // native list. Observe either child as it appears; the bridge binds only
-    // after the exact SP11 field/view/model triplet is present.
     observePainterAssetSearch(widget);
 
-    const QString className = QString::fromLatin1(widget->metaObject()->className());
-    if (auto *itemView = qobject_cast<QAbstractItemView *>(widget)) {
-        if (isDesignerResourceList(itemView) ||
-            isDesignerLibraryTree(itemView)) {
-            installAssetDelegate(itemView);
-            return;
-        }
-        if (QComboBox *combo = owningComboBox(itemView);
-            isLayerChannelSelector(combo)) {
-            lockLayerChannelPopupWidth(combo);
-            return;
-        }
-        if (g_translateLayersPanel && isInsideLayersPanel(itemView)) {
-            installAssetDelegate(itemView, false, true);
-            return;
-        }
-        const bool mainResourceView =
-            className == QStringLiteral("Alg::ResourceListView") &&
-            widget->objectName() == QStringLiteral("resources");
-        const bool pickerView = isResourcePickerView(itemView);
-        const bool folderTree = isResourceFolderTree(itemView);
-        if (mainResourceView || pickerView || folderTree) {
-            installAssetDelegate(itemView, pickerView);
-            return;
-        }
-    }
+    // Painter 下拉框：文本经 QItemDelegate::drawDisplay -> QTextLayout::draw
+    // 绘制，drawText 钩子覆盖不到。给下拉框 view 装一个继承 QItemDelegate 的
+    // 显示层 delegate（只覆写 drawDisplay 翻译非分组文本），绘制逻辑与 Painter
+    // 一致，不改 model 文本。
+    if (auto *combo = qobject_cast<QComboBox *>(widget))
+        installComboReadDelegate(combo);
 
-    if (auto *menu = qobject_cast<QMenu *>(widget)) {
-        translateMenu(menu);
+    auto *itemView = qobject_cast<QAbstractItemView *>(widget);
+    if (!itemView || shouldExcludeLayersPanel(itemView))
+        return;
+
+    const QString className = QString::fromLatin1(itemView->metaObject()->className());
+    if (isDesignerResourceList(itemView) || isDesignerLibraryTree(itemView)) {
+        installAssetDelegate(itemView);
         return;
     }
-    if (auto *menuBar = qobject_cast<QMenuBar *>(widget)) {
-        translateMenuBar(menuBar);
+    if (QComboBox *combo = owningComboBox(itemView);
+        isLayerChannelSelector(combo)) {
+        lockLayerChannelPopupWidth(combo);
         return;
     }
-    if (auto *button = qobject_cast<QAbstractButton *>(widget)) {
-        if (auto *toolButton = qobject_cast<QToolButton *>(button);
-            isLayerBlendModeButton(toolButton)) {
-            // Painter deliberately uses compact native labels (Pthr, NMid,
-            // etc.) in this fixed-width button. Translate only its popup menu.
-            return;
-        }
-        const QString source = sourceForObject(button, button->text());
-        const QString result = translated(source, true,
-                                          translationControlId(widget, source));
-        if (!result.isNull() && button->text() != result) {
-            button->setProperty(kSourceProperty, source);
-            button->setText(result);
-        }
+    if (g_translateLayersPanel && isInsideLayersPanel(itemView)) {
+        installAssetDelegate(itemView, false, true);
         return;
     }
-    if (auto *label = qobject_cast<QLabel *>(widget)) {
-        const QString source = sourceForObject(label, label->text());
-        const QString result = translated(source, true,
-                                          translationControlId(widget, source));
-        if (!result.isNull() && label->text() != result) {
-            label->setProperty(kSourceProperty, source);
-            if (QObject *owner = painterElidedLabelOwner(label)) {
-                // Let Painter's owner update its child QLabel and reapply
-                // elision at the current panel width.
-                owner->setProperty("text", result);
-                if (auto *ownerWidget = qobject_cast<QWidget *>(owner)) {
-                    ownerWidget->updateGeometry();
-                    ownerWidget->update();
-                }
-            } else {
-                label->setText(result);
-            }
-        }
-        return;
-    }
-    if (auto *group = qobject_cast<QGroupBox *>(widget)) {
-        const QString source = sourceForObject(group, group->title());
-        const QString result = translated(source, false,
-                                          translationControlId(widget, source));
-        if (!result.isNull() && group->title() != result) {
-            group->setProperty(kSourceProperty, source);
-            group->setTitle(result);
-        }
-        return;
-    }
-    if (auto *combo = qobject_cast<QComboBox *>(widget)) {
-        if (combo->property(kTranslatingComboProperty).toBool())
-            return;
-        combo->setProperty(kTranslatingComboProperty, true);
-        for (int i = 0; i < combo->count(); ++i) {
-            const QString source = comboSourceAt(combo, i);
-            const QString result = translated(source, false,
-                                              translationControlId(combo, source));
-            if (!result.isNull() && combo->itemText(i) != result) {
-                combo->setItemData(i, source, kComboSourceRole);
-                combo->setItemText(i, result);
-            }
-        }
-        if (isLayerChannelSelector(combo))
-            lockLayerChannelPopupWidth(combo);
-        combo->setProperty(kTranslatingComboProperty, false);
-        return;
-    }
-    if (auto *tabs = qobject_cast<QTabBar *>(widget)) {
-        for (int i = 0; i < tabs->count(); ++i) {
-            const QString displayed = tabs->tabText(i).trimmed();
-            QString source = displayed;
-            const QVariant storedVariant = tabs->tabData(i);
-            if (storedVariant.isValid()) {
-                const QString stored = storedVariant.toString();
-                if (!stored.isEmpty() &&
-                    (displayed == stored ||
-                     g_translations.value(stored) == displayed ||
-                     g_originals.value(displayed) == stored))
-                    source = stored;
-            } else {
-                const auto original = g_originals.constFind(displayed);
-                if (original != g_originals.cend())
-                    source = original.value();
-            }
-            const QString result = translated(source, false,
-                                              translationControlId(tabs, source));
-            if (!result.isNull() && tabs->tabText(i) != result) {
-                tabs->setTabData(i, source);
-                tabs->setTabText(i, result);
-            }
-        }
-        return;
-    }
-    if (auto *dock = qobject_cast<QDockWidget *>(widget)) {
-        const QString source = sourceForObject(dock, dock->windowTitle());
-        const QString result = translated(source, false,
-                                          translationControlId(widget, source));
-        if (!result.isNull() && dock->windowTitle() != result) {
-            dock->setProperty(kSourceProperty, source);
-            dock->setWindowTitle(result);
-        }
-        return;
-    }
-    if (auto *lineEdit = qobject_cast<QLineEdit *>(widget)) {
-        const QString source = sourceForObject(lineEdit, lineEdit->placeholderText());
-        const QString result = translated(source, false,
-                                          translationControlId(widget, source));
-        if (!result.isNull() && lineEdit->placeholderText() != result) {
-            lineEdit->setProperty(kSourceProperty, source);
-            lineEdit->setPlaceholderText(result);
-        }
-    }
+    const bool mainResourceView =
+        className == QStringLiteral("Alg::ResourceListView") &&
+        itemView->objectName() == QStringLiteral("resources");
+    const bool pickerView = isResourcePickerView(itemView);
+    const bool folderTree = isResourceFolderTree(itemView);
+    if (mainResourceView || pickerView || folderTree)
+        installAssetDelegate(itemView, pickerView);
 }
 
 QString originalTextAt(QWidget *widget, const QPoint &position) {
@@ -3201,125 +3310,13 @@ bool editKeyActive(Qt::KeyboardModifiers modifiers) {
     return true;
 }
 
-void restoreTranslatedWidget(QWidget *widget) {
-    if (!widget)
-        return;
-    if (auto *view = qobject_cast<QAbstractItemView *>(widget)) {
-        view->viewport()->update();
-        return;
-    }
-    if (auto *menu = qobject_cast<QMenu *>(widget)) {
-        for (QAction *action : menu->actions()) {
-            const QString source = action->property(kSourceProperty).toString();
-            if (!source.isEmpty()) {
-                action->setText(source);
-                action->setProperty(kSourceProperty, QVariant());
-            }
-        }
-        return;
-    }
-    if (auto *menuBar = qobject_cast<QMenuBar *>(widget)) {
-        for (QAction *action : menuBar->actions()) {
-            const QString source = action->property(kSourceProperty).toString();
-            if (!source.isEmpty()) {
-                action->setText(source);
-                action->setProperty(kSourceProperty, QVariant());
-            }
-        }
-        return;
-    }
-    if (auto *combo = qobject_cast<QComboBox *>(widget)) {
-        for (int i = 0; i < combo->count(); ++i) {
-            const QString stored = comboStoredSource(combo, i);
-            if (stored.isEmpty())
-                continue;
-            const QString current = combo->itemText(i).trimmed();
-            if (current == stored)
-                continue;
-            const QString expected = translated(
-                stored, false, translationControlId(combo, stored));
-            if (current == expected || g_originals.value(current) == stored) {
-                combo->setItemText(i, stored);
-                combo->setItemData(i, QVariant(), kComboSourceRole);
-            }
-        }
-        return;
-    }
-    if (auto *tabs = qobject_cast<QTabBar *>(widget)) {
-        for (int i = 0; i < tabs->count(); ++i) {
-            const QVariant storedVariant = tabs->tabData(i);
-            if (!storedVariant.isValid())
-                continue;
-            const QString stored = storedVariant.toString();
-            if (stored.isEmpty())
-                continue;
-            const QString current = tabs->tabText(i).trimmed();
-            if (current == stored)
-                continue;
-            const QString expected = translated(
-                stored, false, translationControlId(tabs, stored));
-            if (current == expected || g_originals.value(current) == stored) {
-                tabs->setTabText(i, stored);
-                tabs->setTabData(i, QVariant());
-            }
-        }
-        return;
-    }
-
-    const QString source = widget->property(kSourceProperty).toString();
-    if (source.isEmpty())
-        return;
-    if (auto *button = qobject_cast<QAbstractButton *>(widget))
-        button->setText(source);
-    else if (auto *label = qobject_cast<QLabel *>(widget)) {
-        if (QObject *owner = painterElidedLabelOwner(label)) {
-            // Restore through the owner rather than writing the private child
-            // QLabel directly, so its original right-elision is reinstated.
-            owner->setProperty("text", source);
-            if (auto *ownerWidget = qobject_cast<QWidget *>(owner)) {
-                ownerWidget->updateGeometry();
-                ownerWidget->update();
-            }
-        } else {
-            label->setText(source);
-        }
-    }
-    else if (auto *group = qobject_cast<QGroupBox *>(widget))
-        group->setTitle(source);
-    else if (auto *dock = qobject_cast<QDockWidget *>(widget))
-        dock->setWindowTitle(source);
-    else if (auto *lineEdit = qobject_cast<QLineEdit *>(widget))
-        lineEdit->setPlaceholderText(source);
-    widget->setProperty(kSourceProperty, QVariant());
-}
-
-void restoreLayersPanelOriginals() {
-    if (appClosingDown())
-        return;
-    for (QWidget *widget : QApplication::allWidgets()) {
-        if (widget && isInsideLayersPanel(widget))
-            restoreTranslatedWidget(widget);
-    }
-}
-
-void restoreAllTranslatedWidgets() {
-    if (appClosingDown())
-        return;
-    for (QWidget *widget : QApplication::allWidgets()) {
-        if (widget)
-            restoreTranslatedWidget(widget);
-    }
-}
-
 void setTranslateLayersPanel(bool enabled) {
     if (g_translateLayersPanel == enabled)
         return;
     g_translateLayersPanel = enabled;
-    if (enabled) {
-        refreshTranslatedViews();
-        return;
-    }
-    restoreLayersPanelOriginals();
+    // 纯显示层：开/关图层面板翻译只是切换显示层 delegate 的生效条件，
+    // 无需改写任何文本，直接用 refreshTranslatedViews 重绘即可。
+    refreshTranslatedViews();
 }
 
 // 主窗口怎么设置 UI 风格，所有插件弹窗就怎么设置：统一继承主窗口的调色板、
@@ -3850,8 +3847,11 @@ protected:
                     translateWidget(widget);
                 } else if (auto *view =
                                qobject_cast<QAbstractItemView *>(widget)) {
-                    if (QComboBox *combo = owningComboBoxFast(view))
-                        translateWidget(combo);
+                    // 下拉框 popup 的 QComboBoxListView 父链可能不直接到达
+                    // QComboBox（经 QComboBoxPrivateContainer），用全量
+                    // owningComboBox 找到所属 combo 并确保装上显示层 delegate。
+                    if (QComboBox *combo = owningComboBox(view))
+                        installComboReadDelegate(combo);
                 }
             }
         } else if (type == QEvent::Show || type == QEvent::Polish ||
@@ -3867,6 +3867,7 @@ protected:
 TranslationUiFilter *g_filter = nullptr;
 QTimer *g_fallbackTimer = nullptr;
 bool g_fallbackScanEnabled = false;
+QTimer *g_comboRefreshTimer = nullptr;
 
 void scanVisibleWidgets() {
     if (!g_enabled)
@@ -4026,14 +4027,21 @@ extern "C" __declspec(dllexport) void __cdecl sp_delegate_set_enabled(int enable
                 uninstallGraphPainterHooks();
             }
         }
-        scanVisibleWidgets();
     } else {
-        // Disabling the plug-in must immediately restore every widget that
-        // was translated by this delegate back to its original text.
-        restoreAllTranslatedWidgets();
+        // 纯显示层：文本从未被改写，原文始终留在控件的 text()/model 里。
+        // 禁用只需卸载 drawText 钩子并重绘，让界面回到英文原文。
         uninstallGraphPainterHooks();
     }
     refreshGraphViews();
+    // 纯显示层：切换语言不修改任何文本，只强制全量重绘，
+    // 让 drawText 钩子 / 显示层 delegate 按 g_enabled 重新翻译或恢复原文。
+    for (QWidget *widget : QApplication::allWidgets()) {
+        if (!widget)
+            continue;
+        if (auto *view = qobject_cast<QAbstractItemView *>(widget))
+            view->viewport()->update();
+        widget->update();
+    }
 }
 
 extern "C" __declspec(dllexport) int __cdecl
@@ -4122,6 +4130,28 @@ extern "C" __declspec(dllexport) int __cdecl sp_delegate_install_ui(void *applic
         if (g_fallbackScanEnabled)
             g_fallbackTimer->start();
     }
+    if (!g_comboRefreshTimer) {
+        g_comboRefreshTimer = new QTimer(application);
+        g_comboRefreshTimer->setInterval(800);
+        QObject::connect(
+            g_comboRefreshTimer, &QTimer::timeout, application, [] {
+                if (!g_enabled || appClosingDown())
+                    return;
+                // Painter 打开下拉框 popup 时会用回自己的 QItemDelegate，
+                // 这里定期重装显示层 delegate，保证下拉列表项稳定翻译。
+                for (QWidget *widget : QApplication::allWidgets()) {
+                    if (auto *combo = qobject_cast<QComboBox *>(widget))
+                        installComboReadDelegate(combo);
+                }
+            });
+        g_comboRefreshTimer->start();
+    }
+    // 纯显示层:让 drawText 钩子在两个宿主(含 Painter)都常开安装,
+    // 使 generalPainterTranslation 能翻译通用界面文本(样式无关)。
+    // 这些钩子内部会先走 graphPaintTranslation(仅当 g_translateDesignerGraph),
+    // 再走 generalPainterTranslation,因此对 Painter 不会误触节点图逻辑。
+    if (graphHookEnvironmentCompatible())
+        installGraphPainterHooks();
     scanVisibleWidgets();
     return 1;
 }
@@ -4144,6 +4174,11 @@ sp_delegate_uninstall_ui(void *applicationPointer) {
         delete g_fallbackTimer;
         g_fallbackTimer = nullptr;
     }
+    if (g_comboRefreshTimer) {
+        g_comboRefreshTimer->stop();
+        delete g_comboRefreshTimer;
+        g_comboRefreshTimer = nullptr;
+    }
     if (g_filter) {
         delete g_filter;
         g_filter = nullptr;
@@ -4151,4 +4186,5 @@ sp_delegate_uninstall_ui(void *applicationPointer) {
     clearAssetTooltipContext();
     restoreAllAssetTooltipDecorations();
     restoreAssetDelegates();
+    restoreComboDelegates();
 }

@@ -30,6 +30,7 @@ function(add_translator_delegate target output_name qt_root qt_major)
         "${qt_root}/lib/Qt${qt_major}Gui.lib"
         "${qt_root}/lib/Qt${qt_major}Widgets.lib"
         version.lib
+        psapi.lib
     )
     target_compile_definitions(${target} PRIVATE
         QT_CORE_LIB QT_GUI_LIB QT_WIDGETS_LIB UNICODE _UNICODE)
