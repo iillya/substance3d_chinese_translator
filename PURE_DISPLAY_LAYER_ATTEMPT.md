@@ -42,74 +42,35 @@
 `TranslationItemDelegate`（QStyledItemDelegate 子类）仍在资源树 / 图层面板 /
 资源列表上工作，`displayText()` 翻译，不改 model。
 
-### 4. 已确认 Painter 下拉框关键技术事实
+### 4. Painter 下拉框显示层翻译（已落地）
 
 - Painter 的下拉框 `QComboBox` 使用 `QComboBoxListView`（QAbstractItemView）。
-- 平时 `view->itemDelegate()` 为 `QItemDelegate`；`resolution` / `opticalCamera`
-  等个别下拉框为 `QComboBoxDelegate`。
+- 实际 Delegate 类型为 `Alg::DefaultComboBoxDelegate` 和
+  `Alg::SectionComboBoxDelegate`；它们未声明自己的 Qt 元信息，因此
+  `metaObject()` 只会显示基类 `QItemDelegate`，必须通过 RTTI 区分。
 - model 用 `Qt::AccessibleDescriptionRole` 区分行：
   - `section_title`：分组标题，Painter 画成斜体（不是灰色），不可选（disabled）。
   - `section_child`：可选中子项。
-- Painter 运行 Qt **6.8.6**；我们的插件用 SDK Qt **6.5.3**。跨小版本 ABI。
-
-## 未完成 / 卡住的问题
-
-### 下拉框弹出列表项无法稳定翻译
-
-目标：Painter 下拉框弹出列表的每个子项（`section_child`，如 "Base color"）
-翻译成中文，同时保留 Painter 的分组标题（`section_title`）斜体样式。
-
-遇到的障碍：
-
-1. **drawText 钩子覆盖不到下班列表项**
-   `QItemDelegate` / `QStyledItemDelegate` 绘制列表项文本时走
-   `QCommonStylePrivate::viewItemDrawText` → `QTextLayout::draw`，
-   它**不经过 `QPainter::drawText`**，因此 hook 不到。
-   （qcommonstyle.cpp 的 `viewItemDrawText` 直接 `textLayout.draw(p, pos)`。）
-
-2. **替换 delegate 会被 Painter 重置**
-   尝试给 `combo->view()` 装自建 `ComboItemDelegate`（继承 QItemDelegate，
-   覆写 `drawDisplay` 翻译，section_title 设斜体），但 Painter 在弹出下拉框时
-   会把 delegate 换回它自己的 `QItemDelegate`。即使加了 800ms 定时重装，
-   抓到的 delegate 仍总是 `QItemDelegate`。
-
-3. **怀疑真正画列表的 view 不是 `combo->view()`**
-   `enum_listviews` 曾抓到两个 `QComboBoxListView`（一个 QItemDelegate、一个
-   QComboBoxDelegate）。而 popup 打开后 `allWidgets()` 里可见的含
-   `section_title` 的 view 都是 `isVisible()==False`。怀疑弹出列表用的是
-   另一个通过 `combo->view()` 拿不到、`allWidgets()` 也枚举不到的 view。
-
-### 根本矛盾
-
-Painter 的下拉框：
-- 样式由 Painter 私有的 `QItemDelegate` / `QComboBoxDelegate` 绘制（认识
-  `section_title` 斜体分组标题），标准 Qt 同类不认 `section_title`。
-- 文本绘制走 `QTextLayout`（绕开 drawText 钩子）。
-
-因此要用"纯显示层"翻译 Painter 下拉框，只有两条路：
-- **替换 delegate**：能翻译，但丢失 Painter 的 `section_title` 斜体样式
-  （或者 Painter 在 popup 时重置，替换不稳定）。
-- **hook 更底层**：`QTextLayout::draw` 最终调 `QPainter::drawTextItem`，
-  但它拿到的是只读的 `QTextItem`（单个字形片段），改不了文本。
+- `ComboPaintProxyModel` 仅覆盖绘制用索引的 `DisplayRole`，不替换
+  `QComboBox` 或 popup view 的真实 model。
+- `ComboPaintDelegate` 不自行绘图，而是把代理索引交给 Painter 原 Delegate
+  的 `paint()`；其它角色、分组斜体、缩进、行高、悬停和选中样式全部沿用原版。
+- `sizeHint()` 也直接转发给原 Delegate，避免改变布局计算。
+- 已在 Painter 11.1.3 / Qt 6.8.6 的 `JadeToad.spp` 中验证：工程可正常加载，
+  下拉框中文与原生样式同时保留。
 
 ### 已排除的方案
 
+- 替换 popup 的真实 model：破坏 `QComboBox` 与 popup view 的内部模型关系，
+  导致下拉框无法打开。
+- 用标准 `QItemDelegate` 重绘：能显示中文，但会丢失 Painter 私有 Delegate
+  的分组斜体与子项缩进。
 - 继承标准 `QComboBoxDelegate`：它只处理 `separator`，不认 `section_title`，
   且存在私有头 `qcombobox_p.h` 依赖。
 - 直接改 Painter 的原版 delegate 的 vtable（`drawDisplay` 槽）：
-  依赖跨 Qt 版本（6.8.6 vs 6.5.3）的 vtable 布局一致，风险高。
-
-## 下一步可能的方向
-
-1. **放弃纯显示层，用 `setItemText` 改 model 显示值**
-   已验证 Painter 下拉框 model 是 `QStandardItemModel`，item `ItemIsEditable`，
-   `setItemText` 可写。Painter 的 delegate 会照它自己的样式画中文（含
-   section_title 斜体），这样翻译 + 样式都能保住；
-   代价是它不是纯显示层（改 model 显示值），关开关需把原文恢复回 model。
-
-2. **继续定位 Painter 真正画下拉列表的 view / delegate**
-   需要确认 Painter 弹出列表用的是标准 `QComboBox` popup 还是自绘弹出窗，
-   从而找到能稳定替换 / 包装的 delegate 实例。
+  即使运行时确认 `drawDisplay` 位于槽位 21，复制单对象虚表仍会令 Painter
+  11.1.3 启动时报严重错误，因此不采用。
+- 广播 `FontChange` 并强制布局/重绘：不能让 `QTextLayout` 改用译文计算。
 
 ## 索引
 

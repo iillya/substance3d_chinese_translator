@@ -201,18 +201,18 @@ class SecurityRegressionTests(unittest.TestCase):
             "g_assetRowFilter->shutdown()",
         ):
             self.assertIn(marker, cpp)
-        for forbidden in (
-            "QSortFilterProxyModel",
-            "QIdentityProxyModel",
-            "setSourceModel(",
-        ):
-            # The explanatory comment may name the unsupported proxy class;
-            # executable code must not instantiate or configure one.
-            executable = "\n".join(
-                line for line in cpp.splitlines()
-                if not line.lstrip().startswith("//")
-            )
-            self.assertNotIn(forbidden, executable)
+        # Asset search must not replace a live view model. The combo popup
+        # display wrapper may use an unattached identity proxy solely to pass
+        # a translated index to Painter's original delegate.
+        executable = "\n".join(
+            line for line in cpp.splitlines()
+            if not line.lstrip().startswith("//")
+        )
+        self.assertNotIn("QSortFilterProxyModel", executable)
+        self.assertNotIn("view->setModel(", cpp)
+        self.assertNotIn("combo->setModel(", cpp)
+        self.assertIn("ComboPaintProxyModel", cpp)
+        self.assertIn("original_->paint(painter, option, proxy_.mapFromSource(index))", cpp)
 
     def test_native_global_hook_has_teardown(self):
         cpp = CPP_SOURCE.read_text(encoding="utf-8")
@@ -287,11 +287,12 @@ class SecurityRegressionTests(unittest.TestCase):
             "full.startsWith(prefix, Qt::CaseInsensitive)",
             "This must run before the per-object source check",
             "return fullElidedSource.isEmpty() ? displayed : fullElidedSource;",
-            'owner->setProperty("text", result)',
-            'owner->setProperty("text", source)',
-            "original right-elision is reinstated",
         ):
             self.assertIn(marker, cpp)
+        # Pure display-layer translation must never write the translated or
+        # restored text back into Painter's private label owner.
+        self.assertNotIn('owner->setProperty("text", result)', cpp)
+        self.assertNotIn('owner->setProperty("text", source)', cpp)
 
     def test_identity_global_edit_removes_user_override(self):
         cpp = CPP_SOURCE.read_text(encoding="utf-8")
