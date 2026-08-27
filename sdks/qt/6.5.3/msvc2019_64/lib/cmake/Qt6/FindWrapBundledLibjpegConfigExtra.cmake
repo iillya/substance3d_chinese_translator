@@ -1,1 +1,0 @@
-set(QT_USE_BUNDLED_BundledLibjpeg ON CACHE INTERNAL "")
