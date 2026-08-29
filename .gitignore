@@ -43,3 +43,7 @@ build_tools/
 .extractor_test/
 source/sp_tools/c++/build/
 *.exp
+
+# Release artifacts under dist are versioned.
+!/dist/
+!/dist/**
