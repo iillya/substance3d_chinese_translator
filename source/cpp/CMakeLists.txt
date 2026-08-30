@@ -47,7 +47,7 @@ endfunction()
 option(SP_TOOLTIP_DIAGNOSTICS
     "Enable tooltip hook diagnostics for resource hover previews" OFF)
 
-set(QT6_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../sdks/qt/6.5.3/msvc2019_64")
+set(QT6_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../_ThirdParty/Qt/6.5.3/msvc2019_64")
 if(NOT EXISTS "${QT6_ROOT}/lib/Qt6Widgets.lib")
     message(FATAL_ERROR "Bundled Qt6 SDK is missing")
 endif()
@@ -59,7 +59,7 @@ add_translator_delegate(
 
 # Painter 7.2-10.0 / Qt5.12.5. This target is deliberately a separate DLL;
 # loading a Qt6-linked delegate into a Qt5 process is unsafe.
-set(QT5_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../sdks/qt/5.12.5/msvc2017_64")
+set(QT5_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../_ThirdParty/Qt/5.12.5/msvc2017_64")
 if(NOT EXISTS "${QT5_ROOT}/lib/Qt5Widgets.lib")
     message(FATAL_ERROR "Bundled Qt5.12.5 SDK is missing")
 endif()

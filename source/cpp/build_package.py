@@ -101,12 +101,12 @@ def _check_required_files() -> None:
         DEPS_ROOT / "include" / "archive.h",
         DEPS_ROOT / "lib" / "archive.lib",
         DEPS_ROOT / "lib" / "libhdf5.lib",
-        ROOT / "sdks" / "qt" / "6.5.3" / "msvc2019_64" / "lib" / "Qt6Core.lib",
-        ROOT / "sdks" / "qt" / "6.5.3" / "msvc2019_64" / "lib" / "Qt6Gui.lib",
-        ROOT / "sdks" / "qt" / "6.5.3" / "msvc2019_64" / "lib" / "Qt6Widgets.lib",
-        ROOT / "sdks" / "qt" / "5.12.5" / "msvc2017_64" / "lib" / "Qt5Core.lib",
-        ROOT / "sdks" / "qt" / "5.12.5" / "msvc2017_64" / "lib" / "Qt5Gui.lib",
-        ROOT / "sdks" / "qt" / "5.12.5" / "msvc2017_64" / "lib" / "Qt5Widgets.lib",
+        ROOT.parent / "_ThirdParty" / "Qt" / "6.5.3" / "msvc2019_64" / "lib" / "Qt6Core.lib",
+        ROOT.parent / "_ThirdParty" / "Qt" / "6.5.3" / "msvc2019_64" / "lib" / "Qt6Gui.lib",
+        ROOT.parent / "_ThirdParty" / "Qt" / "6.5.3" / "msvc2019_64" / "lib" / "Qt6Widgets.lib",
+        ROOT.parent / "_ThirdParty" / "Qt" / "5.12.5" / "msvc2017_64" / "lib" / "Qt5Core.lib",
+        ROOT.parent / "_ThirdParty" / "Qt" / "5.12.5" / "msvc2017_64" / "lib" / "Qt5Gui.lib",
+        ROOT.parent / "_ThirdParty" / "Qt" / "5.12.5" / "msvc2017_64" / "lib" / "Qt5Widgets.lib",
     ]
     missing = [str(path) for path in required if not path.is_file()]
     if missing:

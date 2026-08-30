@@ -267,7 +267,7 @@ sp插件/
 - CMake。
 - Visual Studio 2022 Build Tools，包含 MSVC C++ 工具链。
 
-Qt SDK 与提取器依赖已随仓库捆绑在根目录 `sdks/` 中，构建时无需 vcpkg，也无需网络。
+Qt SDK 统一放在工作区 `_ThirdParty/Qt/`：Qt 5.12.5 使用 `msvc2017_64`，Qt 6.5.3 使用 `msvc2019_64`。提取器依赖仍随仓库提供，构建时无需 vcpkg。
 
 ### 构建步骤
 
