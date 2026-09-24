@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -310,10 +311,7 @@ void collectJsonMetadata(State &state, const json &value, int depth = 0) {
         return;
     if (value.is_object()) {
         for (const auto &[key, child] : value.items()) {
-            const bool label = state.request.attributes.count("label") != 0 &&
-                std::regex_match(key, std::regex(R"(^label\d*$)"));
-            if (child.is_string() &&
-                (label || state.request.attributes.count(key) != 0)) {
+            if (child.is_string() && selectedAttribute(state, key)) {
                 addTerm(state, child.get<std::string>());
             } else if (key == "values" &&
                        state.request.attributes.count("values") != 0 &&
@@ -333,43 +331,65 @@ void collectJsonMetadata(State &state, const json &value, int depth = 0) {
 }
 
 void parseGlsl(State &state, const fs::path &path) {
+    if (fs::file_size(path) > kMaxParsedFileBytes)
+        throw std::runtime_error("GLSL metadata exceeds the size limit");
     std::ifstream stream(path, std::ios::binary);
     const std::string content((std::istreambuf_iterator<char>(stream)), {});
     if (content.size() > kMaxParsedFileBytes)
         throw std::runtime_error("GLSL metadata exceeds the size limit");
-    // Painter annotations contain ordinary JSON objects embedded in comments.
-    // Try every balanced object and retain those that parse successfully.
-    for (std::size_t start = 0; start < content.size(); ++start) {
-        if (content[start] != '{')
+    // Pair braces once instead of rescanning the tail for every unmatched '{'.
+    // Balanced outer objects keep the old precedence; completed children of an
+    // unclosed outer object are retained for the same recovery at EOF.
+    struct Range { std::size_t start, end; };
+    std::vector<std::size_t> opens;
+    std::vector<Range> completed;
+    bool quoted = false;
+    bool escaped = false;
+    auto collect = [&](const Range &range) {
+        const json parsed = json::parse(
+            content.begin() + static_cast<std::ptrdiff_t>(range.start),
+            content.begin() + static_cast<std::ptrdiff_t>(range.end), nullptr, false);
+        if (!parsed.is_discarded())
+            collectJsonMetadata(state, parsed);
+    };
+    for (std::size_t i = 0; i < content.size(); ++i) {
+        const char c = content[i];
+        if (quoted) {
+            if (escaped) escaped = false;
+            else if (c == '\\') escaped = true;
+            else if (c == '"') quoted = false;
+            // Raw newlines invalidate JSON strings. Recover at the next line
+            // rather than letting a malformed annotation hide later metadata.
+            else if (c == '\n' || c == '\r') quoted = false;
             continue;
-        int depth = 0;
-        bool quoted = false;
-        bool escaped = false;
-        for (std::size_t end = start; end < content.size(); ++end) {
-            const char c = content[end];
-            if (quoted) {
-                if (escaped)
-                    escaped = false;
-                else if (c == '\\')
-                    escaped = true;
-                else if (c == '"')
-                    quoted = false;
-                continue;
+        }
+        if (c == '"' && !opens.empty()) {
+            quoted = true;
+        } else if (c == '{') {
+            if (opens.size() >= 1000000)
+                throw std::runtime_error("GLSL metadata nesting exceeds the size limit");
+            opens.push_back(i);
+        } else if (c == '}' && !opens.empty()) {
+            const Range range{opens.back(), i + 1};
+            opens.pop_back();
+            if (opens.empty()) {
+                collect(range);
+                completed.clear();
+            } else {
+                if (completed.size() >= 1000000)
+                    throw std::runtime_error("GLSL metadata contains too many objects");
+                completed.push_back(range);
             }
-            if (c == '"')
-                quoted = true;
-            else if (c == '{')
-                ++depth;
-            else if (c == '}' && --depth == 0) {
-                const json parsed = json::parse(
-                    content.begin() + static_cast<std::ptrdiff_t>(start),
-                    content.begin() + static_cast<std::ptrdiff_t>(end + 1),
-                    nullptr, false);
-                if (!parsed.is_discarded())
-                    collectJsonMetadata(state, parsed);
-                start = end;
-                break;
-            }
+        }
+    }
+    std::sort(completed.begin(), completed.end(), [](const Range &a, const Range &b) {
+        return a.start < b.start;
+    });
+    std::size_t consumed = 0;
+    for (const Range &range : completed) {
+        if (range.start >= consumed) {
+            collect(range);
+            consumed = range.end;
         }
     }
 }
@@ -438,43 +458,38 @@ bool archiveFormat(const fs::path &path) {
 
 void extractArchive(State &state, const fs::path &source,
                     const fs::path &destination) {
-    archive *reader = archive_read_new();
+    const std::unique_ptr<archive, decltype(&archive_read_free)> owned(
+        archive_read_new(), &archive_read_free);
+    archive *reader = owned.get();
+    if (!reader) throw std::runtime_error("cannot allocate archive reader");
     archive_read_support_filter_all(reader);
     archive_read_support_format_all(reader);
     if (archive_read_open_filename_w(reader, source.c_str(), 10240) != ARCHIVE_OK) {
         const std::string message = archive_error_string(reader)
             ? archive_error_string(reader) : "unable to open archive";
-        archive_read_free(reader);
         throw std::runtime_error(message);
     }
     std::size_t members = 0;
     std::uint64_t memberBytes = 0;
     std::uint64_t archiveBytes = 0;
     archive_entry *entry = nullptr;
-    while (archive_read_next_header(reader, &entry) == ARCHIVE_OK) {
+    int headerStatus = ARCHIVE_OK;
+    while ((headerStatus = archive_read_next_header(reader, &entry)) == ARCHIVE_OK) {
         if (++members > kMaxArchiveMembers) {
-            archive_read_free(reader);
             throw std::runtime_error("archive contains more than 50000 entries");
         }
-        try {
-            consumeExtractedMember(state);
-        } catch (...) {
-            archive_read_free(reader);
-            throw;
-        }
+        consumeExtractedMember(state);
         memberBytes = 0;
         const wchar_t *wideName = archive_entry_pathname_w(entry);
         const char *utf8Name = archive_entry_pathname_utf8(entry);
         const fs::path relative = wideName ? fs::path(wideName)
             : pathFromUtf8(utf8Name ? utf8Name : "");
         if (!safeRelative(relative)) {
-            archive_read_free(reader);
             throw std::runtime_error("unsafe archive path");
         }
         const auto type = archive_entry_filetype(entry);
         if (archive_entry_symlink(entry) || archive_entry_hardlink(entry) ||
             (type != AE_IFREG && type != AE_IFDIR)) {
-            archive_read_free(reader);
             throw std::runtime_error(
                 "archive links and special files are not allowed");
         }
@@ -486,7 +501,6 @@ void extractArchive(State &state, const fs::path &source,
         fs::create_directories(output.parent_path());
         std::ofstream file(output, std::ios::binary | std::ios::trunc);
         if (!file) {
-            archive_read_free(reader);
             throw std::runtime_error("cannot create extracted file");
         }
         const void *buffer = nullptr;
@@ -499,42 +513,70 @@ void extractArchive(State &state, const fs::path &source,
             if (status != ARCHIVE_OK) {
                 const std::string message = archive_error_string(reader)
                     ? archive_error_string(reader) : "archive read failed";
-                archive_read_free(reader);
                 throw std::runtime_error(message);
             }
             memberBytes += size;
             archiveBytes += size;
             if (memberBytes > kMaxArchiveMemberBytes) {
-                archive_read_free(reader);
                 throw std::runtime_error(
                     "archive member exceeds the size limit");
             }
             if (archiveBytes > kMaxArchiveTotalBytes) {
-                archive_read_free(reader);
                 throw std::runtime_error(
                     "archive extraction exceeds the total size limit");
             }
-            try {
-                consumeExpandedBytes(state, size);
-            } catch (...) {
-                archive_read_free(reader);
-                throw;
-            }
+            consumeExpandedBytes(state, size);
+            if (offset < 0 || static_cast<std::uint64_t>(offset) > kMaxArchiveMemberBytes ||
+                size > kMaxArchiveMemberBytes - static_cast<std::uint64_t>(offset))
+                throw std::runtime_error("archive sparse extent exceeds the size limit");
             file.seekp(offset);
             file.write(static_cast<const char *>(buffer),
                        static_cast<std::streamsize>(size));
             if (!file) {
-                archive_read_free(reader);
                 throw std::runtime_error("failed to write extracted file");
             }
         }
         file.flush();
         if (!file) {
-            archive_read_free(reader);
             throw std::runtime_error("failed to flush extracted file");
         }
     }
-    archive_read_free(reader);
+    if (headerStatus != ARCHIVE_EOF)
+        throw std::runtime_error(archive_error_string(reader)
+            ? archive_error_string(reader) : "archive header read failed");
+}
+
+// HDF5 handles must also close when allocation or filesystem operations throw.
+struct HdfHandle {
+    hid_t id;
+    herr_t (*close)(hid_t);
+    HdfHandle(hid_t value, herr_t (*release)(hid_t)) : id(value), close(release) {}
+    ~HdfHandle() { if (id >= 0) close(id); }
+    HdfHandle(const HdfHandle &) = delete;
+    HdfHandle &operator=(const HdfHandle &) = delete;
+};
+
+bool hdfHasVariableStorage(hid_t type, int depth = 0) {
+    if (type < 0 || depth > 64)
+        throw std::runtime_error("invalid or deeply nested HDF5 datatype");
+    const H5T_class_t kind = H5Tget_class(type);
+    if (kind == H5T_NO_CLASS)
+        throw std::runtime_error("cannot inspect HDF5 datatype");
+    if (kind == H5T_VLEN || (kind == H5T_STRING && H5Tis_variable_str(type) > 0))
+        return true;
+    if (kind == H5T_ARRAY) {
+        const HdfHandle base(H5Tget_super(type), H5Tclose);
+        return hdfHasVariableStorage(base.id, depth + 1);
+    }
+    if (kind == H5T_COMPOUND) {
+        const int members = H5Tget_nmembers(type);
+        if (members < 0) throw std::runtime_error("cannot inspect HDF5 members");
+        for (int i = 0; i < members; ++i) {
+            const HdfHandle member(H5Tget_member_type(type, static_cast<unsigned>(i)), H5Tclose);
+            if (hdfHasVariableStorage(member.id, depth + 1)) return true;
+        }
+    }
+    return false;
 }
 
 struct HdfContext {
@@ -553,36 +595,35 @@ herr_t hdfVisitor(hid_t object, const char *name, const H5O_info2_t *info,
         const fs::path relative = pathFromUtf8(name);
         if (!safeRelative(relative))
             throw std::runtime_error("unsafe HDF5 dataset path");
-        const hid_t dataset = H5Dopen2(object, name, H5P_DEFAULT);
+        const HdfHandle datasetHandle(H5Dopen2(object, name, H5P_DEFAULT), H5Dclose);
+        const hid_t dataset = datasetHandle.id;
         if (dataset < 0)
             throw std::runtime_error("cannot open HDF5 dataset");
-        const hid_t type = H5Dget_type(dataset);
-        const hid_t space = H5Dget_space(dataset);
+        const HdfHandle typeHandle(H5Dget_type(dataset), H5Tclose);
+        const HdfHandle spaceHandle(H5Dget_space(dataset), H5Sclose);
+        const hid_t type = typeHandle.id;
+        const hid_t space = spaceHandle.id;
         if (type < 0 || space < 0) {
-            if (type >= 0)
-                H5Tclose(type);
-            if (space >= 0)
-                H5Sclose(space);
-            H5Dclose(dataset);
             throw std::runtime_error("cannot inspect HDF5 dataset");
         }
+        // Variable data reads allocate pointer-backed payloads outside the
+        // byte buffer/budget and cannot be exported as raw asset bytes.
+        if (hdfHasVariableStorage(type))
+            throw std::runtime_error("variable-length HDF5 datasets are not supported");
         const hssize_t points = H5Sget_simple_extent_npoints(space);
         const std::size_t width = H5Tget_size(type);
         if (points < 0 || width == 0 ||
             static_cast<unsigned long long>(points) >
                 (std::numeric_limits<std::size_t>::max)() / width) {
-            H5Sclose(space); H5Tclose(type); H5Dclose(dataset);
             throw std::runtime_error("invalid HDF5 dataset size");
         }
         const std::size_t datasetBytes =
             static_cast<std::size_t>(points) * width;
         if (datasetBytes > kMaxDatasetBytes) {
-            H5Sclose(space); H5Tclose(type); H5Dclose(dataset);
             throw std::runtime_error("HDF5 dataset exceeds the size limit");
         }
         if (datasetBytes >
                 kMaxTaskExpandedBytes - context->state->expandedBytes) {
-            H5Sclose(space); H5Tclose(type); H5Dclose(dataset);
             throw std::runtime_error(
                 "extraction task exceeds the cumulative size limit");
         }
@@ -590,10 +631,8 @@ herr_t hdfVisitor(hid_t object, const char *name, const H5O_info2_t *info,
         std::vector<unsigned char> data(datasetBytes);
         if (!data.empty() && H5Dread(dataset, type, H5S_ALL, H5S_ALL,
                                     H5P_DEFAULT, data.data()) < 0) {
-            H5Sclose(space); H5Tclose(type); H5Dclose(dataset);
             throw std::runtime_error("cannot read HDF5 dataset");
         }
-        H5Sclose(space); H5Tclose(type); H5Dclose(dataset);
         const fs::path output = context->destination / relative;
         fs::create_directories(output.parent_path());
         std::ofstream file(output, std::ios::binary | std::ios::trunc);
@@ -646,6 +685,12 @@ void extractContainer(State &state, const fs::path &source,
         extractArchive(state, source, destination);
 }
 
+bool isShader(const fs::path &path) {
+    static const std::set<std::string> extensions = {
+        ".glsl", ".glslfx", ".vert", ".frag", ".geom", ".tesc", ".tese", ".comp"};
+    return extensions.count(lower(path.extension().string())) != 0;
+}
+
 void scanExtracted(State &state, const fs::path &root, int depth) {
     std::vector<fs::path> files;
     auto iterator = fs::recursive_directory_iterator(root);
@@ -661,10 +706,11 @@ void scanExtracted(State &state, const fs::path &root, int depth) {
             files.push_back(entry.path());
     }
     for (const fs::path &path : files) {
-        const std::string extension = lower(path.extension().string());
-        if (looksLikeXml(path)) {
+        const bool shader = isShader(path);
+        if (shader || looksLikeXml(path)) {
             try {
-                parseXml(state, path);
+                if (shader) parseGlsl(state, path);
+                else parseXml(state, path);
             } catch (const std::exception &error) {
                 state.failures.push_back({{"file", pathUtf8(path)},
                                           {"message", error.what()}});
@@ -678,7 +724,7 @@ void scanExtracted(State &state, const fs::path &root, int depth) {
                                           {"message", error.what()}});
             }
         }
-        if (depth >= kMaxNestedDepth || !isContainer(path))
+        if (shader || depth >= kMaxNestedDepth || !isContainer(path))
             continue;
         if (state.nestedArchives >= kMaxNestedArchives)
             throw std::runtime_error("more than 128 nested containers");
@@ -698,11 +744,12 @@ void processAsset(State &state, const fs::path &asset) {
     static const std::set<std::string> knownContainers = {
         ".sbsar", ".spsm", ".sppr", ".spp", ".sbsprs", ".sbsasm",
         ".zip", ".7z"};
-    static const std::set<std::string> glsl = {
-        ".glsl", ".glslfx", ".vert", ".frag", ".geom", ".tesc",
-        ".tese", ".comp"};
     const std::string extension = lower(asset.extension().string());
-    const bool container = isContainer(asset);
+    // libarchive's mtree detector may accept ordinary shader text as an
+    // archive. Known shader formats go directly to their metadata parser;
+    // this also avoids opening/probing every shader twice.
+    const bool shader = isShader(asset);
+    const bool container = !shader && isContainer(asset);
     if (container || knownContainers.count(extension) != 0 ||
         state.request.ordinaryFilenames)
         addTerm(state, pathUtf8(asset.stem()));
@@ -724,7 +771,7 @@ void processAsset(State &state, const fs::path &asset) {
             fs::remove_all(temporary, ignored);
             throw;
         }
-    } else if (glsl.count(extension) != 0) {
+    } else if (shader) {
         parseGlsl(state, asset);
     } else if (looksLikeXml(asset)) {
         parseXml(state, asset);
@@ -751,18 +798,19 @@ Request loadRequest(const fs::path &path) {
 }
 
 json loadExisting(const fs::path &path) {
-    if (!fs::is_regular_file(path))
+    if (!fs::exists(path))
         return json::object();
-    try {
-        std::ifstream stream(path, std::ios::binary);
-        const json payload = json::parse(stream);
-        if (payload.value("$schema", "") == "sp-translation-v1" &&
-            payload.contains("translations") &&
-            payload["translations"].is_object())
-            return payload["translations"];
-    } catch (...) {
-    }
-    return json::object();
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) throw std::runtime_error("cannot read existing translation package");
+    const json payload = json::parse(stream);
+    if (!payload.is_object() || payload.value("$schema", "") != "sp-translation-v1" ||
+        payload.value("language", "") != "zh-CN" || !payload.contains("translations") ||
+        !payload["translations"].is_object())
+        throw std::runtime_error("existing translation package is invalid; output unchanged");
+    for (const auto &value : payload["translations"])
+        if (!value.is_string())
+            throw std::runtime_error("existing translation value is not a string; output unchanged");
+    return payload["translations"];
 }
 
 void writeResult(const State &state) {
@@ -805,6 +853,7 @@ void writeResult(const State &state) {
     {
         std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
         stream << payload.dump(2) << '\n';
+        stream.flush();
         if (!stream)
             throw std::runtime_error("failed to write output JSON");
     }

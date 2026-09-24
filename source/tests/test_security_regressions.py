@@ -13,7 +13,9 @@ SOURCE = ROOT / "source"
 MODULE_SOURCE = SOURCE / "substance3d_chinese_translator" / "__init__.py"
 CPP_SOURCE = SOURCE / "cpp" / "translation_ui_delegate.cpp"
 EXTRACTOR_SOURCE = SOURCE / "cpp" / "extractor.cpp"
-ARCHIVE = ROOT / "dist" / "substance3d_chinese_translator.zip"
+ARCHIVE = Path(os.environ.get(
+    "SP_TEST_ARCHIVE", ROOT / "dist" / "substance3d_chinese_translator.zip"
+))
 
 
 def _load_build_module():

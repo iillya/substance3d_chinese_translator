@@ -3,6 +3,7 @@
 #include "host_fixtures.h"
 #include <QtCore/QEventLoop>
 #include <QtCore/QElapsedTimer>
+#include <QtCore/QTemporaryDir>
 #include <QtGui/QStandardItemModel>
 #include <iostream>
 #include <stdexcept>
@@ -10,6 +11,18 @@
 void check(bool condition, const char *message) {
     if (!condition) throw std::runtime_error(message);
 }
+
+// Qt 5.12's Windows QMessageBox::showEvent dereferences the platform native
+// interface, which qoffscreen does not provide. Skip that native-window step
+// only in this test; the dialog's modal loop, callbacks and teardown still run.
+class OffscreenMessageBoxFilter : public QObject {
+public:
+    bool eventFilter(QObject *object, QEvent *event) override {
+        return QT_VERSION < QT_VERSION_CHECK(6, 0, 0) &&
+            QGuiApplication::platformName() == QStringLiteral("offscreen") &&
+            event->type() == QEvent::Show && qobject_cast<QMessageBox *>(object);
+    }
+};
 
 class PaintProbe : public QLabel {
 public:
@@ -83,6 +96,7 @@ public:
 class GraphOwnerProbe : public QGraphicsItem {
 public:
     double lookupUs = 0;
+    double drawUs = 0;
     QRectF boundingRect() const override { return QRectF(0, 0, 100, 30); }
     void paint(QPainter *painter, const QStyleOptionGraphicsItem *, QWidget *) override {
         QElapsedTimer timer;
@@ -90,6 +104,101 @@ public:
         for (int i = 0; i < 100; ++i)
             check(graphOwnerItem(painter) == this, "benchmark graph owner");
         lookupUs = timer.nsecsElapsed() / 100000.0;
+        check(g_graphPaintIndexes.count(painter) == 1,
+              "actual Qt painter lifetime enables the batch index");
+        timer.restart();
+        for (int i = 0; i < 100; ++i)
+            hookedDrawRectFAlign(painter, boundingRect(), Qt::AlignLeft,
+                                QStringLiteral("Graph benchmark missing 94017"), nullptr);
+        drawUs = timer.nsecsElapsed() / 100000.0;
+    }
+};
+
+class LayoutCountingResourceView : public Alg::ResourceListView {
+public:
+    using Alg::ResourceListView::ResourceListView;
+    int layouts = 0;
+    void doItemsLayout() override {
+        ++layouts;
+        Alg::ResourceListView::doItemsLayout();
+    }
+};
+
+class CountingResourceModel : public QStandardItemModel {
+public:
+    mutable int displayReads = 0;
+    QVariant data(const QModelIndex &index, int role = Qt::DisplayRole) const override {
+        if (role == Qt::DisplayRole) ++displayReads;
+        return QStandardItemModel::data(index, role);
+    }
+};
+
+class MovingResourceModel : public QAbstractListModel {
+public:
+    QStringList rows{QStringLiteral("Concrete"), QStringLiteral("Other")};
+    int rowCount(const QModelIndex &parent = QModelIndex()) const override {
+        return parent.isValid() ? 0 : int(rows.size());
+    }
+    QVariant data(const QModelIndex &index, int role) const override {
+        return index.isValid() && role == Qt::DisplayRole ? QVariant(rows.at(index.row())) : QVariant();
+    }
+    void moveFirstToLast() {
+        check(beginMoveRows({}, 0, 0, {}, 2), "resource move begins");
+        rows.move(0, 1);
+        endMoveRows();
+    }
+};
+
+// Invoke the same single-shot filter callback without including its intentional
+// 40 ms debounce delay in measurements. No mouse/keyboard or host is involved.
+void runPendingSearch(AssetRowFilter &filter) {
+    auto *timer = filter.findChild<QTimer *>();
+    check(timer && timer->isSingleShot(), "search uses an owned single-shot timer");
+    timer->stop();
+    check(QMetaObject::invokeMethod(timer, "timeout", Qt::DirectConnection),
+          "search callback can be exercised offscreen");
+}
+
+class GraphResolutionProbe : public QGraphicsItem {
+public:
+    int paints = 0;
+    QRectF boundingRect() const override { return QRectF(0, 0, 100, 30); }
+    void paint(QPainter *painter, const QStyleOptionGraphicsItem *, QWidget *) override {
+        ++paints;
+        auto *view = designerGraphViewForPainter(painter);
+        check(view && view->scene(), "graph resolver test uses an actual viewport");
+        for (qreal offset : {0.0, 0.375, 0.0, 0.375, 0.0, 0.375}) {
+            painter->save();
+            painter->translate(offset, offset);
+            // Reference the previous exhaustive algorithm, including first-tie
+            // selection and nearest-transform fallback for non-exact matches.
+            QGraphicsItem *expected = nullptr;
+            qreal best = 1.0e20;
+            for (auto *item : view->scene()->items()) {
+                const qreal distance = transformDifference(
+                    painter->worldTransform(),
+                    item->deviceTransform(view->viewportTransform()));
+                if (distance < best) {
+                    expected = item;
+                    best = distance;
+                }
+            }
+            qreal distance = 0;
+            check(graphOwnerItem(painter, &distance) == expected && distance == best,
+                  "optimized lookup preserves exhaustive owner/distance semantics");
+            GraphPaintContext context(painter);
+            const int side = graphPortLabelSide(painter, boundingRect(), &context);
+            check(context.owner().fullTitle == graphFullTitleFromItem(expected) &&
+                  context.owner().transform == expected->deviceTransform(view->viewportTransform()),
+                  "draw context resolves the same owner metadata");
+            check(graphPaintTranslation(painter, QStringLiteral("Material …"), side, &context) ==
+                      graphPaintTranslation(painter, QStringLiteral("Material …"), side),
+                  "shared draw context preserves node translation");
+            painter->restore();
+        }
+        const auto batch = g_graphPaintIndexes.find(painter);
+        check(batch != g_graphPaintIndexes.end() && batch->second->ready,
+              "regression covers the indexed path beyond the adaptive threshold");
     }
 };
 
@@ -173,15 +282,44 @@ int benchmark(QApplication &app, const QString &dictionaryDirectory) {
     graphView.setSceneRect(0, 0, 160, 60);
     graphView.resize(160, 60);
     graphView.show();
+    g_translateDesignerGraph = true;
     for (int count : {100, 1000, 5000}) {
         while (scene.items().size() < count) {
             auto *item = scene.addRect(0, 0, 10, 10);
             item->setPos(10000 + scene.items().size(), 10000);
         }
-        renderWidget(graphView);
-        std::cout << "graph_owner_" << count << "_us=" << probe->lookupUs << '\n';
+        // First and last positions expose best/worst traversal order rather
+        // than making an early-exit optimization look uniformly constant-time.
+        for (int position : {-1, 1}) {
+            probe->setZValue(position);
+            renderWidget(graphView);
+            const char *order = position < 0 ? "last" : "first";
+            std::cout << "graph_owner_" << count << '_' << order << "_us=" << probe->lookupUs << '\n';
+            std::cout << "graph_rect_" << count << '_' << order << "_us=" << probe->drawUs << '\n';
+        }
     }
     check(sp_delegate_uninstall_ui(&app) == 1, "benchmark teardown");
+    g_enabled = true;
+    Alg::ResourcePickerWidget picker;
+    LayoutCountingResourceView resources(&picker);
+    Alg::SearchFieldLineEdit search(&picker);
+    QStandardItemModel model;
+    for (int i = 0; i < 5000; ++i)
+        model.appendRow(new QStandardItem(i % 2 ? QStringLiteral("Concrete")
+                                               : QStringLiteral("Other absent 94017")));
+    resources.setModel(&model);
+    AssetRowFilter filter;
+    filter.observe(&resources);
+    search.setText(QStringLiteral("混凝土"));
+    runPendingSearch(filter);
+    check(resources.isRowHidden(0) && !resources.isRowHidden(1),
+          "benchmark actually applies the Chinese row mask");
+    resources.layouts = 0;
+    timer.restart();
+    for (int i = 0; i < 20; ++i) runPendingSearch(filter);
+    std::cout << "search_5000_unchanged_ms=" << timer.nsecsElapsed() / 20.e6 << '\n';
+    std::cout << "search_unchanged_layouts=" << resources.layouts << '\n';
+    filter.shutdown();
     return 0;
 }
 
@@ -191,6 +329,48 @@ int main(int argc, char **argv) {
     try {
         if (argc == 3 && QString::fromLocal8Bit(argv[1]) == QStringLiteral("--benchmark"))
             return benchmark(app, QString::fromLocal8Bit(argv[2]));
+        check(containsCjk(QString::fromUtf8("\xf0\xa0\x80\x80")) &&
+              !containsCjk(QString::fromUtf8("\xf0\x9f\x98\x80")),
+              "allocation-free Han detection preserves supplementary characters");
+        check(normalizeForMatch(QString::fromUtf8("Ｒóugh_Glass …")) == QStringLiteral("roughglass"),
+              "normalization cache preserves width, accents and elision folding");
+        sp_delegate_add_translation(L"Concrete", L"混凝土");
+        check(translated(QStringLiteral("cONCrete")) == QStringLiteral("混凝土"), "warm fuzzy hit");
+        sp_delegate_set_fuzzy_match(0);
+        check(translated(QStringLiteral("cONCrete")).isNull(), "fuzzy option invalidates cached hits");
+        sp_delegate_set_fuzzy_match(1);
+        check(translated(QStringLiteral("Con&crete"), true) == QStringLiteral("混凝土") &&
+              translated(QStringLiteral("Con&crete"), false).isNull(), "mnemonic policies have distinct caches");
+        check(translated(QStringLiteral("Future term")).isNull(), "cache a miss");
+        sp_delegate_add_translation(L"Future term", L"新词条");
+        check(translated(QStringLiteral("Future term")) == QStringLiteral("新词条"), "new entry invalidates miss");
+        const QString id = QStringLiteral("Test||QLabel||None||Concrete");
+        sp_delegate_add_id_translation(L"Test||QLabel||None||Concrete", L"专用译文");
+        check(translated(QStringLiteral("Concrete"), false, id) == QStringLiteral("专用译文"), "scoped cached hit");
+        sp_delegate_add_id_translation(L"Test||QLabel||None||Concrete", L"_skip_");
+        check(translated(QStringLiteral("Concrete"), false, id).isNull(), "skip rule invalidates cached translation");
+        sp_delegate_add_id_translation(L"Test||QLabel||None||*", L"_skip_");
+        sp_delegate_add_translation(L"Value || Other", L"错误译文");
+        check(translated(QStringLiteral("Value || Other"), false,
+              QStringLiteral("Test||QLabel||None||Value || Other")).isNull(),
+              "wildcard excludes source text containing the ID separator");
+        const QByteArray bulk = R"({"translations":[["roughglass","first"],["Rough Glass","last"]],"control_ids":{}})";
+        check(sp_delegate_replace_translations(bulk.constData(), int(bulk.size())) == 1,
+              "atomic dictionary replacement succeeds");
+        check(translated(QStringLiteral("ROUGH_GLASS")) == QStringLiteral("last"),
+              "bulk upload preserves normalization override order");
+        const auto revision = g_dictionaryRevision;
+        const QByteArray invalid = R"({"translations":[["broken",42]],"control_ids":{}})";
+        check(sp_delegate_replace_translations(invalid.constData(), int(invalid.size())) == 0 &&
+              g_dictionaryRevision == revision && translated(QStringLiteral("ROUGH_GLASS")) == QStringLiteral("last"),
+              "invalid bulk upload preserves the previous dictionary and revision");
+        for (int i = 0; i < 12000; ++i) {
+            translated(QStringLiteral("absent text %1").arg(i));
+            normalizeForMatch(QString::number(i));
+        }
+        check(g_lookupResults.totalCost() <= g_lookupResults.maxCost() &&
+              g_normalizedText.totalCost() <= g_normalizedText.maxCost(), "text caches obey memory budgets");
+        sp_delegate_clear_translations();
         const QString source = QStringLiteral("Concrete");
         const QString target = QStringLiteral("混凝土");
         g_translations.insert(source, target);
@@ -282,9 +462,9 @@ int main(int argc, char **argv) {
         check(g_fuzzyResolved.isEmpty(), "dictionary update invalidates cached misses");
 
         Alg::ResourcePickerWidget resourcePicker;
-        Alg::ResourceListView resourceList(&resourcePicker);
+        LayoutCountingResourceView resourceList(&resourcePicker);
         Alg::SearchFieldLineEdit resourceSearch(&resourcePicker);
-        QStandardItemModel resourceModel;
+        CountingResourceModel resourceModel;
         resourceModel.appendRow(new QStandardItem(QStringLiteral("Concrete")));
         resourceModel.appendRow(new QStandardItem(QStringLiteral("Native hidden")));
         resourceModel.appendRow(new QStandardItem(QStringLiteral("Other")));
@@ -301,12 +481,78 @@ int main(int argc, char **argv) {
         check(resourceSearch.text() == QStringLiteral("混凝 土") &&
               resourceSearch.selectedText() == QStringLiteral("混凝"),
               "search preserves text and selection");
+        resourceList.layouts = 0;
+        resourceModel.displayReads = 0;
+        runPendingSearch(rowFilter);
+        check(resourceList.layouts == 0, "unchanged search mask does not force layout");
+        check(resourceModel.displayReads == 0, "warm search does not reread model text");
+        rowFilter.translationsChanged();
+        runPendingSearch(rowFilter);
+        check(resourceModel.displayReads > 0, "dictionary reload rebuilds search text");
+        auto *searchTimer = rowFilter.findChild<QTimer *>();
+        resourceModel.item(0)->setData(QColor(Qt::red), Qt::DecorationRole);
+        resourceModel.item(0)->setData(QStringLiteral("Resource help"), Qt::ToolTipRole);
+        resourceModel.item(0)->setData(QSize(48, 48), Qt::SizeHintRole);
+        check(!searchTimer->isActive(), "thumbnail-only updates do not schedule search");
+        resourceModel.item(0)->setData(1, Qt::UserRole);
+        check(searchTimer->isActive(), "unknown host roles still trigger search");
+        runPendingSearch(rowFilter);
+        resourceModel.dataChanged(resourceModel.index(0, 0), resourceModel.index(2, 0));
+        check(searchTimer->isActive(), "unspecified changed roles still trigger search");
+        runPendingSearch(rowFilter);
+        resourceModel.item(2)->setText(source);
+        check(searchTimer->isActive(), "changed labels schedule search");
+        runPendingSearch(rowFilter);
+        check(!resourceList.isRowHidden(2) && resourceList.layouts > 0,
+              "changed model still updates search visibility and layout");
+        resourceModel.item(2)->setText(QStringLiteral("Other"));
+        runPendingSearch(rowFilter);
         resourceSearch.clear(); flushSearch();
         check(resourceList.isRowHidden(1) && !resourceList.isRowHidden(2),
               "clearing search restores only plugin-hidden rows");
         rowFilter.shutdown();
         check(resourceList.model() == &resourceModel && resourceList.isRowHidden(1),
               "search teardown preserves the native model and row state");
+        CountingResourceModel replacementModel;
+        replacementModel.appendRow(new QStandardItem(QStringLiteral("Other")));
+        replacementModel.appendRow(new QStandardItem(source));
+        resourceList.setModel(&replacementModel);
+        rowFilter.setActive(true);
+        rowFilter.observe(&resourceList);
+        resourceSearch.setText(target);
+        runPendingSearch(rowFilter);
+        check(resourceList.isRowHidden(0) && !resourceList.isRowHidden(1),
+              "model replacement cannot reuse old row text");
+        replacementModel.clear();
+        replacementModel.appendRow(new QStandardItem(source));
+        replacementModel.appendRow(new QStandardItem(QStringLiteral("Other")));
+        runPendingSearch(rowFilter);
+        check(!resourceList.isRowHidden(0) && resourceList.isRowHidden(1),
+              "model reset invalidates cached row positions");
+        resourceList.setObjectName(QStringLiteral("new_scope"));
+        const std::wstring scopedId = controlUniqueId(&resourceList, source).toStdWString();
+        sp_delegate_add_id_translation(scopedId.c_str(), L"_skip_");
+        runPendingSearch(rowFilter);
+        check(resourceList.isRowHidden(0), "new scoped skip rules invalidate search text");
+        g_idTranslations.clear();
+        invalidateDictionaryCaches();
+        runPendingSearch(rowFilter);
+        check(!resourceList.isRowHidden(0), "removed scope rules restore search results");
+        resourceSearch.clear();
+        rowFilter.shutdown();
+        MovingResourceModel movingModel;
+        resourceList.setModel(&movingModel);
+        rowFilter.setActive(true);
+        rowFilter.observe(&resourceList);
+        resourceSearch.setText(target);
+        runPendingSearch(rowFilter);
+        check(!resourceList.isRowHidden(0) && resourceList.isRowHidden(1), "initial moving resource mask");
+        movingModel.moveFirstToLast();
+        check(rowFilter.findChild<QTimer *>()->isActive(), "moving rows schedules refilter");
+        runPendingSearch(rowFilter);
+        check(resourceList.isRowHidden(0) && !resourceList.isRowHidden(1), "moved rows use current cached text");
+        rowFilter.shutdown();
+        rowFilter.shutdown();
         check(graphHookEnvironmentCompatible(), "compiled Qt major supported");
         QLabel nativeLabel(source);
         nativeLabel.resize(180, 30);
@@ -343,9 +589,27 @@ int main(int argc, char **argv) {
         g_translations.insert(QStringLiteral("Material One"), QStringLiteral("材质一"));
         g_translations.insert(QStringLiteral("Material Two"), QStringLiteral("材质二"));
         renderWidget(graphView);
+        check(g_graphPaintIndexes.empty(), "painter destruction releases all batch indexes");
         check(graphLabel->lastTranslation == QStringLiteral("材质一") &&
               otherGraphLabel->lastTranslation == QStringLiteral("材质二"),
               "same elided title uses each node's own tooltip cache entry");
+        auto *resolverProbe = new GraphResolutionProbe;
+        scene.addItem(resolverProbe);
+        resolverProbe->setToolTip(QStringLiteral("Material One"));
+        renderWidget(graphView);
+        const int originalPaints = resolverProbe->paints;
+        check(originalPaints > 0, "owner regression probe actually paints");
+        resolverProbe->setPos(10, 5);
+        resolverProbe->setZValue(2);
+        graphView.scale(1.25, 0.9);
+        renderWidget(graphView);
+        delete otherGraphLabel;
+        resolverProbe->setParentItem(graphLabel);
+        graphLabel->setRotation(15);
+        renderWidget(graphView);
+        check(resolverProbe->paints >= originalPaints + 2,
+              "owner checks run again after move, zoom, delete and reparent");
+        delete resolverProbe;
         g_translateDesignerGraph = false;
         auto checkPaint = [&](QWidget &widget, const char *message) {
             widget.resize(240, 80);
@@ -469,6 +733,49 @@ int main(int argc, char **argv) {
         check(!g_fallbackTimer->isActive(), "disabled engine stops fallback wakeups");
         check(compactList.gridSize() == QSize(80, 80) && !compactList.wordWrap(),
               "disabling restores original resource grid geometry");
+        QWidget popupWidthProbe;
+        popupWidthProbe.setMinimumWidth(20);
+        popupWidthProbe.setMaximumWidth(600);
+        lockPopupWidth(&popupWidthProbe, 150);
+        lockPopupWidth(&popupWidthProbe, 200);
+        sp_delegate_set_enabled(0);
+        check(popupWidthProbe.minimumWidth() == 20 && popupWidthProbe.maximumWidth() == 600,
+              "disabling restores popup constraints before repeated locks");
+        lockPopupWidth(&popupWidthProbe, 150);
+        popupWidthProbe.setMaximumWidth(500);
+        setTranslateLayersPanel(false);
+        check(popupWidthProbe.minimumWidth() == 20 && popupWidthProbe.maximumWidth() == 500,
+              "layer toggle restores only constraints still owned by plugin");
+        QTemporaryDir dictionaryDir;
+        const QString invalidPath = dictionaryDir.filePath(QStringLiteral("bad_zh.json"));
+        QFile invalidDictionary(invalidPath);
+        check(invalidDictionary.open(QIODevice::WriteOnly), "create invalid dictionary fixture");
+        const QByteArray invalidBytes = R"({"$schema":"sp-translation-v1","language":"zh-CN","translations":["retain me"]})";
+        invalidDictionary.write(invalidBytes);
+        invalidDictionary.close();
+        QString saveError;
+        check(!saveTranslation(source, target, &saveError, invalidPath), "editor rejects invalid existing entries");
+        check(invalidDictionary.open(QIODevice::ReadOnly) && invalidDictionary.readAll() == invalidBytes,
+              "editor preserves invalid dictionary bytes");
+        invalidDictionary.close();
+        bool protectedResultDialog = false;
+        OffscreenMessageBoxFilter modalPlatformFilter;
+        app.installEventFilter(&modalPlatformFilter);
+        QTimer::singleShot(0, &app, [&] {
+            auto *editor = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            check(editor, "native translation editor is modal");
+            auto *field = editor->findChild<QLineEdit *>(QStringLiteral("sp_translation_target"));
+            check(field, "translation field present");
+            field->clear();
+            editor->accept();
+            QTimer::singleShot(0, &app, [&] {
+                auto *message = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+                protectedResultDialog = message && g_editDialogOpen && sp_delegate_uninstall_ui(&app) == 0;
+                if (message) message->accept();
+            });
+        });
+        editTranslation(source, {}, {}, nullptr);
+        check(protectedResultDialog && !g_editDialogOpen, "result dialogs retain native unload protection");
         check(sp_delegate_uninstall_ui(&app) == 1, "second teardown");
         std::cout << "Display behavior passed on Qt " << qVersion() << '\n';
     } catch (const std::exception &error) {

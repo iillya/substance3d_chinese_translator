@@ -207,7 +207,7 @@ class EditTrigger:
                 self.key = str(stored)
                 # 旧版可能保存过不带修饰键的组合（如 Z+左键），已不再接受，
                 # 读取时回退到默认 Ctrl。
-                if self.key and not self._has_modifier():
+                if self.key and not self._has_modifier(self.key):
                     self.key = "Ctrl"
         except (TypeError, ValueError):
             pass
@@ -642,7 +642,7 @@ def load_translation_packages():
             loaded = 0
             if name.lower() == "control_ids_zh.json":
                 # ID 专属词库：与全局词库同格式（根级 translations），
-# 键为完整控件 ID（上级类名||自身类名||自身 objectName||原文）。
+                # 键为完整控件 ID（上级类名||自身类名||自身 objectName||原文）。
                 for source, target in entries.items():
                     if (isinstance(source, str) and isinstance(target, str)
                             and source and target):
@@ -678,18 +678,10 @@ def _load_native_delegate():
         dll.sp_delegate_api_version.argtypes = []
         dll.sp_delegate_api_version.restype = ctypes.c_int
         api_version = dll.sp_delegate_api_version()
-        if api_version != 15:
-            raise RuntimeError("原生翻译模块 API 不兼容：需要 15，实际 %s" % api_version)
-        dll.sp_delegate_clear_translations.argtypes = []
-        dll.sp_delegate_clear_translations.restype = None
-        dll.sp_delegate_reserve_translations.argtypes = [ctypes.c_int]
-        dll.sp_delegate_reserve_translations.restype = None
-        dll.sp_delegate_add_translation.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
-        dll.sp_delegate_add_translation.restype = None
-        dll.sp_delegate_add_id_translation.argtypes = [
-            ctypes.c_wchar_p, ctypes.c_wchar_p
-        ]
-        dll.sp_delegate_add_id_translation.restype = None
+        if api_version != 16:
+            raise RuntimeError("原生翻译模块 API 不兼容：需要 16，实际 %s" % api_version)
+        dll.sp_delegate_replace_translations.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        dll.sp_delegate_replace_translations.restype = ctypes.c_int
         dll.sp_delegate_set_fallback_path.argtypes = [ctypes.c_wchar_p]
         dll.sp_delegate_set_fallback_path.restype = None
         dll.sp_delegate_set_id_path.argtypes = [ctypes.c_wchar_p]
@@ -716,8 +708,6 @@ def _load_native_delegate():
         dll.sp_delegate_set_translate_layers.restype = None
         dll.sp_delegate_set_translate_designer_graph.argtypes = [ctypes.c_int]
         dll.sp_delegate_set_translate_designer_graph.restype = ctypes.c_int
-        dll.sp_delegate_install.argtypes = [ctypes.c_void_p]
-        dll.sp_delegate_install.restype = ctypes.c_int
         dll.sp_delegate_install_ui.argtypes = [ctypes.c_void_p]
         dll.sp_delegate_install_ui.restype = ctypes.c_int
         dll.sp_delegate_uninstall_ui.argtypes = [ctypes.c_void_p]
@@ -754,11 +744,6 @@ def _sync_native_dictionary():
         return False
     try:
         _apply_dictionary_reload_callback(dll)
-        if HOST == "designer":
-            # Start with graph translation disabled; the saved opt-in is applied
-            # only after the UI engine has installed successfully.
-            dll.sp_delegate_set_translate_designer_graph(0)
-        dll.sp_delegate_clear_translations()
         dll.sp_delegate_set_fallback_path(
             os.path.join(TRANSLATIONS_DIR, "user_added_zh.json")
         )
@@ -769,13 +754,15 @@ def _sync_native_dictionary():
         dll.sp_delegate_set_fuzzy_match(int(FUZZY_MATCH_ENABLED))
         dll.sp_delegate_set_fallback_scan(int(FALLBACK_SCAN_ENABLED))
         EDIT_TRIGGER.apply_to_native()
-        dll.sp_delegate_reserve_translations(len(TRANSLATE_DICT))
-        for source, target in TRANSLATE_DICT.items():
-            if isinstance(source, str) and isinstance(target, str):
-                dll.sp_delegate_add_translation(source, target)
-        for id_string, target in ID_TRANSLATE_DICTS.items():
-            if isinstance(id_string, str) and isinstance(target, str):
-                dll.sp_delegate_add_id_translation(id_string, target)
+        payload = json.dumps({
+            # An array retains override order when normalized keys collide.
+            "translations": [(source, target) for source, target in TRANSLATE_DICT.items()
+                             if isinstance(source, str) and isinstance(target, str)],
+            "control_ids": {source: target for source, target in ID_TRANSLATE_DICTS.items()
+                            if isinstance(source, str) and isinstance(target, str)},
+        }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if not dll.sp_delegate_replace_translations(payload, len(payload)):
+            raise RuntimeError("批量词典同步失败，原生引擎保留上一版词典")
         dll.sp_delegate_set_enabled(int(IS_TRANSLATION_ENABLED))
         return True
     except Exception as exc:
@@ -881,18 +868,18 @@ def _ensure_zh_json_suffix(path):
 
 
 def _load_existing_translations(path):
-    """读取已有翻译包中的 translations 对象；文件无效或不存在时返回空字典。"""
-    if not os.path.isfile(path):
+    """Read existing entries; refuse to overwrite an unreadable or invalid file."""
+    if not os.path.exists(path):
         return {}
-    try:
-        with open(path, "r", encoding="utf-8-sig") as stream:
-            payload = json.load(stream)
-        if payload.get("$schema") == "sp-translation-v1":
-            entries = payload.get("translations", {})
-            return entries if isinstance(entries, dict) else {}
-    except Exception:
-        pass
-    return {}
+    with open(path, "r", encoding="utf-8-sig") as stream:
+        payload = json.load(stream)
+    if (not isinstance(payload, dict)
+            or payload.get("$schema") != "sp-translation-v1"
+            or payload.get("language") != "zh-CN"
+            or not isinstance(payload.get("translations"), dict)
+            or any(not isinstance(value, str) for value in payload["translations"].values())):
+        raise ValueError("已有翻译包格式无效，未覆盖：%s" % path)
+    return payload["translations"]
 
 
 def _is_extractable(name):
@@ -942,7 +929,7 @@ class ChineseTranslationToolDialog(QtWidgets.QDialog):
         self._cancelled = False
         self._extractor_process = None
         self._extractor_request = ""
-        self._extractor_stdout = ""
+        self._extractor_stdout = b""
         self._build_ui()
 
     def _build_ui(self):
@@ -1398,10 +1385,9 @@ class ChineseTranslationToolDialog(QtWidgets.QDialog):
                 QtWidgets.QApplication.processEvents()
 
             existing = _load_existing_translations(output)
-            translations = {
-                name: existing.get(name, "") if isinstance(existing.get(name, ""), str) else ""
-                for name in names
-            }
+            translations = dict(existing)
+            for name in names:
+                translations.setdefault(name, "")
             payload = {
                 "$schema": "sp-translation-v1",
                 "id": "painter-untranslated-assets",
@@ -1557,11 +1543,9 @@ class ChineseTranslationToolDialog(QtWidgets.QDialog):
                 QtWidgets.QApplication.processEvents()
 
             existing = _load_existing_translations(output)
-            translations = {
-                name: existing.get(name, "")
-                if isinstance(existing.get(name, ""), str) else ""
-                for name in names
-            }
+            translations = dict(existing)
+            for name in names:
+                translations.setdefault(name, "")
             payload = {
                 "$schema": "sp-translation-v1",
                 "id": "designer-untranslated-assets",
@@ -1688,34 +1672,11 @@ class ChineseTranslationToolDialog(QtWidgets.QDialog):
                 self, "无法开始", "缺少 C++ 词条提取器。请重新安装插件。"
             )
             return
-        # 空目录直接拦截，避免启动提取器后误报"完成 0 条"。
-        has_files = False
-        output_abs = os.path.abspath(output)
-        for root, dirs, files in os.walk(folder):
-            dirs[:] = [
-                name for name in dirs
-                if name != "__pycache__" and name != "_unpacked_assets"
-                and not name.startswith(".")
-            ]
-            for name in files:
-                if os.path.abspath(os.path.join(root, name)) != output_abs:
-                    has_files = True
-                    break
-            if has_files:
-                break
-        if not has_files:
-            QtWidgets.QMessageBox.warning(
-                self, "无法开始",
-                "资产目录为空（或仅包含被忽略的隐藏/缓存目录），"
-                "没有可提取的文件。",
-            )
-            return
+        # The native worker validates/enumerates the directory once. A Python
+        # os.walk here would repeat that I/O and block the host UI on slow disks.
         excluded = set(TRANSLATE_DICT)
-        # control_ids_zh.json 的 ID 专属词条同样不应重复提取。
-        for id_string in ID_TRANSLATE_DICTS:
-            source = id_string.rsplit("||", 1)[-1] if isinstance(id_string, str) else ""
-            if source and source != "*":
-                excluded.add(source)
+        # Scoped UI translations do not translate asset names globally.
+        # Match the native export rule: only global entries are excluded.
         descriptor, request_path = tempfile.mkstemp(
             prefix="sp_translation_request_", suffix=".json"
         )
@@ -1747,7 +1708,7 @@ class ChineseTranslationToolDialog(QtWidgets.QDialog):
         self._set_running(True)
         self.status_label.setText("正在启动 C++ 词条提取器…")
         self._extractor_request = request_path
-        self._extractor_stdout = ""
+        self._extractor_stdout = b""
         process = QtCore.QProcess(self)
         self._extractor_process = process
         process.readyReadStandardOutput.connect(
@@ -1766,12 +1727,14 @@ class ChineseTranslationToolDialog(QtWidgets.QDialog):
             return
         self._extractor_stdout += bytes(
             process.readAllStandardOutput()
-        ).decode("utf-8", errors="replace")
-        while "\n" in self._extractor_stdout:
+        )
+        # QProcess may split a UTF-8 character across reads. Decode complete
+        # protocol lines, not arbitrary byte chunks.
+        while b"\n" in self._extractor_stdout:
             line, self._extractor_stdout = self._extractor_stdout.split(
-                "\n", 1
+                b"\n", 1
             )
-            line = line.strip()
+            line = line.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
             try:
@@ -1842,22 +1805,31 @@ class ChineseTranslationToolDialog(QtWidgets.QDialog):
             self._extractor_request = ""
 
     def _extractor_finished(self, exit_code, _exit_status):
+        process = self._extractor_process
         self._read_extractor_output()
         self._read_extractor_error()
         self._cleanup_extractor_request()
         self._set_running(False)
         if self._cancelled:
-            self.status_label.setText("已取消，没有覆盖输出文件。")
+            self.status_label.setText("提取已停止；若取消前已完成写入，输出文件会保留。")
         elif exit_code != 0:
             self.status_label.setText(f"提取失败（错误码 {exit_code}）")
         self._extractor_process = None
+        if is_safe(process):
+            process.deleteLater()
 
-    def _extractor_error(self, _error):
+    def _extractor_error(self, error):
         process = self._extractor_process
         if not is_safe(process):
             return
         error_text = process.errorString()
         self.log.appendPlainText(f"提取器错误：{error_text}")
+        failed_to_start = (QtCore.QProcess.ProcessError.FailedToStart if QT_MAJOR >= 6
+                           else QtCore.QProcess.FailedToStart)
+        if error != failed_to_start:
+            # Crashed/read/write errors still have a live process or a pending
+            # finished signal. Keep ownership until that final cleanup.
+            return
         # QProcess 启动失败时（如提取器被占用）不会触发 finished()，
         # 这里补做收尾，避免界面一直停在“运行中”。
         self._read_extractor_output()
@@ -1865,6 +1837,7 @@ class ChineseTranslationToolDialog(QtWidgets.QDialog):
         self._set_running(False)
         self.status_label.setText(f"提取器启动失败：{error_text}")
         self._extractor_process = None
+        process.deleteLater()
 
     def _cancel(self):
         self._cancelled = True
@@ -2245,8 +2218,8 @@ class _DownloadProgressDialog(QtWidgets.QDialog):
         self._label.setText("正在取消…")
 
     def reject(self):
-        # Closing the window requests cancellation but keeps the modal loop
-        # alive until the worker has actually released its output file.
+        # The owned poll timer exits the modal loop promptly; the worker alone
+        # owns its output file until it finishes.
         self._request_cancel()
 
     def set_progress(self, downloaded, total):
@@ -2294,7 +2267,6 @@ def _validate_update_archive(path, expected_version=None):
         infos = archive.infolist()
         if len(infos) > MAX_UPDATE_FILES:
             raise RuntimeError("更新包文件数超过安全上限。")
-        names = set()
         file_names = set()
         folded_names = set()
         expanded = 0
@@ -2304,7 +2276,6 @@ def _validate_update_archive(path, expected_version=None):
             if folded in folded_names:
                 raise RuntimeError(f"更新包含重复路径：{name}")
             folded_names.add(folded)
-            names.add(name)
             if info.is_dir():
                 continue
             file_names.add(name)
@@ -2399,7 +2370,64 @@ def _download_update(url, destination, expected_sha256, expected_version,
     return destination
 
 
+_update_check_active = False
+
+
+def _run_release_query(parent):
+    """Run network I/O off the UI thread; cancellation never joins that thread."""
+    dialog = _DownloadProgressDialog(parent)
+    dialog.setWindowTitle("检查更新")
+    dialog._label.setText("正在检查 GitHub 更新…")
+    done = threading.Event()
+    state = {}
+
+    def query():
+        # This closure owns no Qt objects and never calls back into the engine.
+        try:
+            state["result"] = _latest_release_info()
+        except Exception as exc:
+            state["error"] = exc
+        finally:
+            done.set()
+
+    timer = QtCore.QTimer(dialog)
+    timer.setInterval(50)
+
+    def poll():
+        if IS_CLEANING or IS_APP_QUITTING or dialog.is_cancelled() or done.is_set():
+            dialog.accept()
+
+    timer.timeout.connect(poll)
+    worker = threading.Thread(target=query, name="translation-release-query", daemon=True)
+    try:
+        worker.start()
+        timer.start()
+        dialog.exec_()
+        if (IS_CLEANING or IS_APP_QUITTING or not is_safe(dialog)
+                or dialog.is_cancelled() or not done.is_set()):
+            raise _DownloadCancelled()
+        if "error" in state:
+            raise state["error"]
+        return state["result"]
+    finally:
+        if is_safe(timer):
+            timer.stop()
+        if is_safe(dialog):
+            delete(dialog)
+
+
 def _check_updates(parent=None):
+    global _update_check_active
+    if _update_check_active or IS_CLEANING or IS_APP_QUITTING:
+        return
+    _update_check_active = True
+    try:
+        _check_updates_once(parent)
+    finally:
+        _update_check_active = False
+
+
+def _check_updates_once(parent=None):
     """Check GitHub for a newer release and download it when available."""
     if parent is None:
         parent = QtWidgets.QApplication.activeWindow()
@@ -2418,13 +2446,7 @@ def _check_updates(parent=None):
         )
         return
     try:
-        QtWidgets.QApplication.setOverrideCursor(WAIT_CURSOR)
-        try:
-            version, download_url, notes, expected_sha256 = (
-                _latest_release_info()
-            )
-        finally:
-            QtWidgets.QApplication.restoreOverrideCursor()
+        version, download_url, notes, expected_sha256 = _run_release_query(parent)
         if _version_tuple(version) <= _version_tuple(PLUGIN_VERSION):
             QtWidgets.QMessageBox.information(
                 parent,
@@ -2463,76 +2485,94 @@ def _check_updates(parent=None):
         def _download_worker():
             try:
                 _download_update(
-                    download_url,
-                    destination,
-                    expected_sha256,
-                    version,
-                    lambda downloaded, total: state.update(
-                        downloaded=downloaded, total=total
-                    ),
+                    download_url, destination, expected_sha256, version,
+                    lambda downloaded, total: state.update(downloaded=downloaded, total=total),
                     cancel_event.is_set,
                 )
-                state["done"] = True
             except _DownloadCancelled:
                 state["error"] = "cancelled"
-                state["done"] = True
             except Exception as exc:
                 state["error"] = str(exc)
+            finally:
+                # The worker owns the file until it closes. Cancellation or
+                # host teardown never makes the UI wait in thread.join().
                 state["done"] = True
+                if cancel_event.is_set():
+                    try:
+                        os.remove(destination)
+                    except OSError:
+                        pass
 
         def _on_cancel():
             cancel_event.set()
+            if is_safe(progress_dialog):
+                progress_dialog.accept()
 
         progress_dialog._cancel_button.clicked.connect(_on_cancel)
-
         worker = threading.Thread(target=_download_worker, daemon=True)
-        worker.start()
+        timer = QtCore.QTimer(progress_dialog)
+        timer.setInterval(100)
 
         def _tick():
+            if IS_CLEANING or IS_APP_QUITTING or not is_safe(progress_dialog):
+                cancel_event.set()
+                if is_safe(progress_dialog):
+                    progress_dialog.accept()
+                return
+            if progress_dialog.is_cancelled():
+                _on_cancel()
+                return
             if state["done"]:
-                if not progress_dialog.is_cancelled():
+                if not state["error"]:
                     progress_dialog.set_finished()
                 progress_dialog.accept()
                 return
-            if cancel_event.is_set() or progress_dialog.is_cancelled():
+            progress_dialog.set_progress(state["downloaded"], state["total"])
+
+        timer.timeout.connect(_tick)
+        cancelled = True
+        try:
+            worker.start()
+            timer.start()
+            progress_dialog.exec_()
+            cancelled = (IS_CLEANING or IS_APP_QUITTING or not is_safe(progress_dialog)
+                         or progress_dialog.is_cancelled() or not state["done"])
+        finally:
+            if cancelled:
                 cancel_event.set()
-                QtCore.QTimer.singleShot(100, _tick)
-                return
-            progress_dialog.set_progress(
-                state["downloaded"], state["total"]
-            )
-            QtCore.QTimer.singleShot(100, _tick)
+                if not worker.is_alive():
+                    try:
+                        os.remove(destination)
+                    except OSError:
+                        pass
+            if is_safe(timer):
+                timer.stop()
+            if is_safe(progress_dialog):
+                delete(progress_dialog)
 
-        # The modal event loop renders the dialog (layout is activated before
-        # the first paint) while the timer keeps the bar in sync with the
-        # background download thread.
-        QtCore.QTimer.singleShot(0, _tick)
-        progress_dialog.exec_()
-
-        cancelled = (
-            cancel_event.is_set() or progress_dialog.is_cancelled()
-        )
         if cancelled:
             cancel_event.set()
-            worker.join()
-            try:
-                os.remove(destination)
-            except OSError:
-                pass
-            return
-        worker.join()
         error = state.get("error")
-        if error:
-            try:
-                os.remove(destination)
-            except OSError:
-                pass
+        if cancelled or error:
+            # If completion raced with cancellation, the worker may already
+            # have passed its cleanup check. It no longer holds the file here.
+            if state["done"]:
+                try:
+                    os.remove(destination)
+                except OSError:
+                    pass
+            if cancelled:
+                return
             raise RuntimeError(error)
         # Apply the package in place without closing the host application,
         # then ask the user to restart so the new files (and native DLL)
         # are loaded.
         _apply_update_now(destination, parent)
+    except _DownloadCancelled:
+        return
     except Exception as exc:
+        if IS_CLEANING or IS_APP_QUITTING or (parent is not None and not is_safe(parent)):
+            return
         detail = str(exc)
         if "403" in detail or "rate limit" in detail.casefold():
             hint = (
@@ -2625,6 +2665,7 @@ def _apply_update_now(zip_path, parent=None):
     backup_dir = UPDATE_BACKUP_DIR
     stage_dir = None
     preserve_dir = None
+    replacement_started = False
     wait_cursor_active = False
     QtWidgets.QApplication.setOverrideCursor(WAIT_CURSOR)
     wait_cursor_active = True
@@ -2639,25 +2680,7 @@ def _apply_update_now(zip_path, parent=None):
         stage_dir = tempfile.mkdtemp(prefix="sp_update_stage_")
         _validate_update_archive(zip_path)
         with zipfile.ZipFile(zip_path) as archive:
-            # Reject path traversal and symlinks before anything is written:
-            # a tampered update package must never escape the staging folder.
-            for info in archive.infolist():
-                raw_name = info.filename.replace("\\", "/")
-                parts = [part for part in raw_name.split("/")
-                         if part not in ("", ".")]
-                unsafe = (
-                    raw_name.startswith("/")
-                    or any(part == ".." for part in parts)
-                    or (len(raw_name) >= 2 and raw_name[1] == ":")
-                )
-                if unsafe:
-                    raise RuntimeError(
-                        f"更新包包含不安全路径：{info.filename}"
-                    )
-                if (info.external_attr >> 16) & 0o170000 == 0o120000:
-                    raise RuntimeError(
-                        f"更新包包含符号链接：{info.filename}"
-                    )
+            # Use the same member validator as the preflight check.
             for info in archive.infolist():
                 normalized = _normalized_zip_name(info)
                 target = os.path.abspath(os.path.join(
@@ -2701,6 +2724,9 @@ def _apply_update_now(zip_path, parent=None):
                 new_files.add(rel.replace(os.sep, "/"))
 
         # Replace every shipped file, tolerating the loaded native DLL.
+        # Only failures after this point may roll back the fresh complete
+        # backup. A rejected ZIP must never restore an unrelated old backup.
+        replacement_started = True
         for rel in sorted(new_files):
             src = os.path.join(stage_dir, rel.replace("/", os.sep))
             target = os.path.join(PLUGIN_DIR, rel.replace("/", os.sep))
@@ -2774,8 +2800,9 @@ def _apply_update_now(zip_path, parent=None):
     except Exception as exc:
         # Roll back to the backup so a failed update never leaves a broken
         # plug-in directory.
+        rollback_error = None
         try:
-            if os.path.isdir(backup_dir) and os.path.isfile(
+            if replacement_started and os.path.isdir(backup_dir) and os.path.isfile(
                 os.path.join(backup_dir, "__init__.py")
             ):
                 for name in os.listdir(PLUGIN_DIR):
@@ -2788,17 +2815,21 @@ def _apply_update_now(zip_path, parent=None):
                     except OSError:
                         pass
                 _copytree_merge(backup_dir, PLUGIN_DIR)
-        except Exception:
-            pass
+        except Exception as restore_error:
+            rollback_error = str(restore_error)
         kept = (
             f"\n更新包保留在：{zip_path}，可稍后重试或手动安装。"
             if os.path.isfile(zip_path) else ""
         )
         restore_wait_cursor()
+        recovery = ("插件目录未开始替换。" if not replacement_started else
+                    "插件已恢复为更新前的版本。")
+        if rollback_error:
+            recovery = "自动恢复未完成：%s\n备份保留在：%s" % (rollback_error, backup_dir)
         QtWidgets.QMessageBox.warning(
             parent,
             "更新失败",
-            f"应用更新失败：\n{exc}\n\n插件目录已保持/恢复为原版本。{kept}",
+            f"应用更新失败：\n{exc}\n\n{recovery}{kept}",
         )
         return False
     finally:
@@ -2809,35 +2840,11 @@ def _apply_update_now(zip_path, parent=None):
 
 
 def _cleanup_update_remnants():
-    """Remove backups and temporary leftovers of a completed update."""
-    local_app_data = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
-    for name in (
-        os.path.basename(UPDATE_BACKUP_DIR),
-        "Substance3DChineseTranslationUpdate",
-    ):
-        path = os.path.join(local_app_data, name)
-        if os.path.isdir(path):
-            shutil.rmtree(path, ignore_errors=True)
-    temp_dir = tempfile.gettempdir()
-    for name in ("substance3d_apply_update.ps1",
-                 os.path.basename(UPDATE_RESULT_FILE)):
-        try:
-            os.remove(os.path.join(temp_dir, name))
-        except OSError:
-            pass
+    """Clean only this installation; another SP/SD instance may be updating."""
+    if os.path.isdir(UPDATE_BACKUP_DIR):
+        shutil.rmtree(UPDATE_BACKUP_DIR, ignore_errors=True)
     try:
-        for name in os.listdir(temp_dir):
-            if name.startswith("sp_update_stage") or name.startswith(
-                "sp_update_preserve"
-            ):
-                path = os.path.join(temp_dir, name)
-                try:
-                    if os.path.isdir(path):
-                        shutil.rmtree(path, ignore_errors=True)
-                    else:
-                        os.remove(path)
-                except OSError:
-                    pass
+        os.remove(UPDATE_RESULT_FILE)
     except OSError:
         pass
 
@@ -2869,27 +2876,11 @@ def _notify_update_result(main_window):
         # The new version is running, so the backup and temporary leftovers
         # are removed before the success prompt is displayed.
         _cleanup_update_remnants()
-    if message and is_safe(main_window):
-        if warning:
-            QtCore.QTimer.singleShot(
-                1500,
-                lambda: (
-                    QtWidgets.QMessageBox.warning(
-                        main_window, "更新未完成", message
-                    )
-                    if is_safe(main_window) else None
-                ),
-            )
-        else:
-            QtCore.QTimer.singleShot(
-                1500,
-                lambda: (
-                    QtWidgets.QMessageBox.information(
-                        main_window, "插件已更新", message
-                    )
-                    if is_safe(main_window) else None
-                ),
-            )
+    # Already called by the owned startup notification timer; a second detached
+    # singleShot could outlive plugin teardown.
+    if message and is_safe(main_window) and not IS_CLEANING and not IS_APP_QUITTING:
+        show = QtWidgets.QMessageBox.warning if warning else QtWidgets.QMessageBox.information
+        show(main_window, "更新未完成" if warning else "插件已更新", message)
 
 
 def show_translation_tool():
@@ -3165,6 +3156,7 @@ def start_plugin():
             0,
             lambda window=main_window: (
                 _set_registered_plugin_display_name(window)
+                if not IS_CLEANING and not IS_APP_QUITTING else None
             ),
         )
         _schedule_update_notification(main_window)

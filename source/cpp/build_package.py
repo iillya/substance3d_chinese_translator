@@ -9,7 +9,7 @@ Layout:
     source/cpp/                             C++ translation engine
     source/native/                          built binaries
     source/translations/                    shared SP/SD dictionaries
-    sdks/                                   bundled Qt SDKs and extractor deps
+    SP_DEPS_ROOT                            extractor headers and static libraries
     dist/substance3d_chinese_translator.zip unified release archive
 
 One-click build (run from the plug-in root):
@@ -51,7 +51,7 @@ DELEGATE_QT6_DLL = CPP_BUILD / "Release" / "translator_delegate_qt6.dll"
 DELEGATE_QT5_DLL = CPP_BUILD / "Release" / "translator_delegate_qt5.dll"
 EXTRACTOR_EXE = CPP_BUILD / "Release" / "translator_extractor.exe"
 NATIVE_DIR = SRC / "native"
-DEPS_ROOT = ROOT / "sdks" / "deps"
+DEPS_ROOT = Path(os.environ.get("SP_DEPS_ROOT", ROOT / "sdks" / "deps")).resolve()
 
 RELEASE_FILES = {
     "__init__.py": SRC / "__init__.py",
@@ -193,14 +193,16 @@ def _build_native() -> None:
     subprocess.run(
         [
             cmake, "-S", str(CPP_SRC), "-B", str(CPP_BUILD),
-            "-A", "x64",
+            "-A", "x64", "-DSP_BUILD_EXTRACTOR=ON",
+            "-DSP_DEPS_ROOT=" + str(DEPS_ROOT),
         ],
         check=True,
         env=_build_environment(),
     )
     print("编译 C++ 原生模块（Release）……")
     subprocess.run(
-        [cmake, "--build", str(CPP_BUILD), "--config", "Release"],
+        [cmake, "--build", str(CPP_BUILD), "--config", "Release", "--target",
+         "translator_delegate_qt5", "translator_delegate_qt6", "translator_extractor"],
         check=True,
         env=_build_environment(),
     )
