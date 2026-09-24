@@ -189,7 +189,7 @@ class SecurityRegressionTests(unittest.TestCase):
             "Pfx::DataBase::ResourcesListModel",
             "globalSearch",
             "&QLineEdit::textChanged",
-            "QSignalBlocker",
+            'QMetaObject::invokeMethod(field_, "textChanged"',
             "setRowHidden",
             "restoreNativeQuery",
             "refreshRowMask",
@@ -212,7 +212,7 @@ class SecurityRegressionTests(unittest.TestCase):
         self.assertNotIn("view->setModel(", cpp)
         self.assertNotIn("combo->setModel(", cpp)
         self.assertIn("ComboPaintProxyModel", cpp)
-        self.assertIn("original_->paint(painter, option, proxy_.mapFromSource(index))", cpp)
+        self.assertIn("activeDelegate()->paint(painter, option, displayIndex)", cpp)
 
     def test_native_global_hook_has_teardown(self):
         cpp = CPP_SOURCE.read_text(encoding="utf-8")
@@ -253,14 +253,14 @@ class SecurityRegressionTests(unittest.TestCase):
             "QEvent::LayoutRequest",
             "QEvent::UpdateRequest",
             "allowHeightGrowth",
-            "requiredHeight = adjustedHint.height()",
+            "document->size().height()",
             "sp_asset_preview_original_min_height",
-            "label->setMinimumHeight(requiredHeight)",
+            "label->setMinimumHeight(height)",
             "restoreAssetTooltipDecoration",
             "restoreAllAssetTooltipDecorations",
             "Qt::FindDirectChildrenOnly",
-            "containsOurTranslation",
-            "label->setMinimumHeight(lockedMinimum)",
+            "sp_asset_preview_document",
+            "document->documentLayout()->draw",
         ):
             self.assertIn(marker, cpp)
         for obsolete in (
@@ -280,13 +280,12 @@ class SecurityRegressionTests(unittest.TestCase):
         cpp = CPP_SOURCE.read_text(encoding="utf-8")
         for marker in (
             "sourceFromPainterElidedLabel",
-            "painterElidedLabelOwner",
             'QStringLiteral("Alg::ElidedLabel")',
             'QStringLiteral("Alg::EditLabel")',
             'parent->property("text")',
             "full.startsWith(prefix, Qt::CaseInsensitive)",
-            "This must run before the per-object source check",
-            "return fullElidedSource.isEmpty() ? displayed : fullElidedSource;",
+            "label->text().trimmed() == trimmed",
+            "if (!full.isEmpty()) source = full;",
         ):
             self.assertIn(marker, cpp)
         # Pure display-layer translation must never write the translated or

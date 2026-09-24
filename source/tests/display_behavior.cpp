@@ -1,0 +1,479 @@
+// Run with QT_QPA_PLATFORM=offscreen. No host application or mouse is used.
+#include "../cpp/translation_ui_delegate.cpp"
+#include "host_fixtures.h"
+#include <QtCore/QEventLoop>
+#include <QtCore/QElapsedTimer>
+#include <QtGui/QStandardItemModel>
+#include <iostream>
+#include <stdexcept>
+
+void check(bool condition, const char *message) {
+    if (!condition) throw std::runtime_error(message);
+}
+
+class PaintProbe : public QLabel {
+public:
+    using QLabel::QLabel;
+    QString input = QStringLiteral("Concrete");
+    QString result;
+    void paintEvent(QPaintEvent *) override {
+        QPainter painter(this);
+        result = generalPainterTranslation(&painter, input);
+    }
+    QString probe() {
+        show();
+        QPixmap image(size());
+        render(&image);
+        return result;
+    }
+};
+
+class RecordingDelegate : public QStyledItemDelegate {
+public:
+    mutable QString measured;
+    mutable QString painted;
+    const QAbstractItemModel *eventModel = nullptr;
+    void paint(QPainter *, const QStyleOptionViewItem &,
+               const QModelIndex &index) const override {
+        painted = index.data().toString();
+    }
+    QSize sizeHint(const QStyleOptionViewItem &, const QModelIndex &index) const override {
+        measured = index.data().toString();
+        return QSize(measured.size() * 10, 20);
+    }
+    bool editorEvent(QEvent *, QAbstractItemModel *model,
+                     const QStyleOptionViewItem &, const QModelIndex &index) override {
+        eventModel = model;
+        return index.model() == model && index.data().toString() == QStringLiteral("Concrete");
+    }
+};
+
+QImage renderWidget(QWidget &widget) {
+    widget.ensurePolished();
+    QImage image(widget.size(), QImage::Format_ARGB32_Premultiplied);
+    image.fill(Qt::transparent);
+    widget.render(&image);
+    return image;
+}
+
+class PreviewSourceView : public QListView {
+public:
+    QModelIndex indexAt(const QPoint &) const override {
+        return model() ? model()->index(0, 0) : QModelIndex();
+    }
+};
+
+void flushSearch() {
+    QEventLoop loop;
+    QTimer::singleShot(70, &loop, &QEventLoop::quit);
+    loop.exec();
+}
+
+class GraphLabel : public QGraphicsItem {
+public:
+    QString source = QStringLiteral("Concrete");
+    QString lastTranslation;
+    QRectF boundingRect() const override { return QRectF(0, 0, 160, 30); }
+    void paint(QPainter *painter, const QStyleOptionGraphicsItem *, QWidget *) override {
+        lastTranslation = graphPaintTranslation(painter, source);
+        painter->drawText(QPointF(2, 20), source);
+    }
+};
+
+class GraphOwnerProbe : public QGraphicsItem {
+public:
+    double lookupUs = 0;
+    QRectF boundingRect() const override { return QRectF(0, 0, 100, 30); }
+    void paint(QPainter *painter, const QStyleOptionGraphicsItem *, QWidget *) override {
+        QElapsedTimer timer;
+        timer.start();
+        for (int i = 0; i < 100; ++i)
+            check(graphOwnerItem(painter) == this, "benchmark graph owner");
+        lookupUs = timer.nsecsElapsed() / 100000.0;
+    }
+};
+
+// A reproducible microbenchmark, not a claim about total SP/SD CPU usage.
+int benchmark(QApplication &app, const QString &dictionaryDirectory) {
+    PROCESS_MEMORY_COUNTERS_EX before{}, after{};
+    GetProcessMemoryInfo(GetCurrentProcess(),
+        reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&before), sizeof(before));
+    QElapsedTimer timer;
+    timer.start();
+    const QDir directory(dictionaryDirectory);
+    for (const QString &name : directory.entryList({QStringLiteral("*_zh.json")}, QDir::Files)) {
+        QFile file(directory.filePath(name));
+        check(file.open(QIODevice::ReadOnly), "benchmark dictionary readable");
+        QJsonParseError error;
+        const QJsonObject root = QJsonDocument::fromJson(file.readAll(), &error).object();
+        check(error.error == QJsonParseError::NoError, "benchmark dictionary valid JSON");
+        const QJsonObject entries = root.value(QStringLiteral("translations")).toObject();
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            if (!it.value().isString()) continue;
+            const std::wstring key = it.key().toStdWString();
+            const std::wstring target = it.value().toString().toStdWString();
+            if (name == QStringLiteral("control_ids_zh.json"))
+                sp_delegate_add_id_translation(key.c_str(), target.c_str());
+            else
+                sp_delegate_add_translation(key.c_str(), target.c_str());
+        }
+    }
+    const double loadMs = timer.nsecsElapsed() / 1.e6;
+    GetProcessMemoryInfo(GetCurrentProcess(),
+        reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&after), sizeof(after));
+    std::cout << "Qt=" << qVersion() << " entries=" << g_translations.size()
+              << " scoped=" << g_idTranslations.size() << " load_ms=" << loadMs
+              << " private_bytes_delta=" << (qint64(after.PrivateUsage) - qint64(before.PrivateUsage)) << '\n';
+    QStringList exact, normalized;
+    for (auto it = g_translations.cbegin(); it != g_translations.cend(); ++it) {
+        if (it.key().contains(QStringLiteral("||")) || containsCjk(it.key())) continue;
+        exact.append(it.key());
+    }
+    exact.sort();
+    for (const QString &key : exact) normalized.append(normalizeForMatch(key));
+    check(!exact.isEmpty(), "benchmark has terms");
+    volatile qint64 checksum = 0;
+    auto measureLookup = [&](const char *name, const QStringList &queries) {
+        const int count = 200000;
+        timer.restart();
+        for (int i = 0; i < count; ++i)
+            checksum += translated(queries.at(i % queries.size())).size();
+        std::cout << name << "_us=" << timer.nsecsElapsed() / (1000.0 * count) << '\n';
+    };
+    measureLookup("exact", exact);
+    measureLookup("normalized", normalized);
+    measureLookup("miss", {QStringLiteral("This benchmark phrase is absent 94017")});
+    // Keep the rendered text identical in all three modes so shorter Chinese
+    // glyph runs do not misleadingly appear to be negative hook overhead.
+    QLabel label(QStringLiteral("Untranslated benchmark label 94017"));
+    label.resize(240, 40);
+    label.show(); app.processEvents();
+    QImage image(label.size(), QImage::Format_ARGB32_Premultiplied);
+    auto measurePaint = [&](const char *name) {
+        for (int i = 0; i < 100; ++i) label.render(&image);
+        timer.restart();
+        const int count = 4000;
+        for (int i = 0; i < count; ++i) label.render(&image);
+        std::cout << name << "_us=" << timer.nsecsElapsed() / (1000.0 * count) << '\n';
+    };
+    measurePaint("label_unhooked");
+    check(sp_delegate_install_ui(&app) == 1, "benchmark installs engine");
+    sp_delegate_set_enabled(0);
+    measurePaint("label_disabled");
+    sp_delegate_set_enabled(1);
+    measurePaint("label_enabled");
+    check(g_fallbackTimer && !g_fallbackTimer->isActive(), "default scan is idle");
+    std::cout << "default_scan_timer_active=" << g_fallbackTimer->isActive()
+              << " hook_slots=" << g_graphHookSlots.size() << " checksum=" << checksum << '\n';
+    QGraphicsScene scene;
+    auto *probe = new GraphOwnerProbe;
+    scene.addItem(probe);
+    Pfx::Editor::Components::Graph::GraphView graphView;
+    graphView.setScene(&scene);
+    graphView.setSceneRect(0, 0, 160, 60);
+    graphView.resize(160, 60);
+    graphView.show();
+    for (int count : {100, 1000, 5000}) {
+        while (scene.items().size() < count) {
+            auto *item = scene.addRect(0, 0, 10, 10);
+            item->setPos(10000 + scene.items().size(), 10000);
+        }
+        renderWidget(graphView);
+        std::cout << "graph_owner_" << count << "_us=" << probe->lookupUs << '\n';
+    }
+    check(sp_delegate_uninstall_ui(&app) == 1, "benchmark teardown");
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    QApplication app(argc, argv);
+    app.setFont(QFont(QStringLiteral("Microsoft YaHei"), 12));
+    try {
+        if (argc == 3 && QString::fromLocal8Bit(argv[1]) == QStringLiteral("--benchmark"))
+            return benchmark(app, QString::fromLocal8Bit(argv[2]));
+        const QString source = QStringLiteral("Concrete");
+        const QString target = QStringLiteral("混凝土");
+        g_translations.insert(source, target);
+        g_translations.insert(QStringLiteral("Material"), QStringLiteral("材质"));
+        PaintProbe label;
+        label.resize(160, 30);
+        label.setText(source);
+        check(label.probe() == target, "plain label paint translation");
+        check(label.text() == source, "host label source unchanged");
+        check(originalTextAt(&label, QPoint()) == source, "original-text tooltip");
+        g_idTranslations.insert(controlUniqueId(&label, source), QStringLiteral("专用译文"));
+        check(label.probe() == QStringLiteral("专用译文"), "control ID wins over global dictionary");
+        g_idTranslations.clear();
+        g_translations.insert(target, QStringLiteral("自定义混凝土"));
+        label.input = target;
+        label.setText(target);
+        check(label.probe() == QStringLiteral("自定义混凝土"),
+              "explicit dictionary override of native Chinese is preserved");
+        {
+            QScopedValueRollback<QString> presentation(g_delegatePaintText, target);
+            check(label.probe().isEmpty(), "resolved delegate text is not translated twice");
+        }
+        label.input = source;
+        label.setText(source);
+        g_translations.remove(target);
+        g_enabled = false;
+        check(label.probe().isEmpty(), "disabled paint falls through to English");
+        g_enabled = true;
+        label.input = QStringLiteral("Mater…");
+        check(label.probe().isEmpty(), "ambiguous ellipsis is not guessed");
+        label.input = source;
+
+        QLineEdit editor;
+        editor.setText(source);
+        editor.setSelection(1, 3);
+        PaintProbe editorChild(&editor);
+        editorChild.resize(100, 20);
+        check(editorChild.probe().isEmpty(), "editor paint is protected by actual owner");
+        editor.show(); editor.setFocus(); app.processEvents();
+        check(label.probe() == target, "focused editor does not suppress another label");
+        check(editor.text() == source && editor.selectedText() == QStringLiteral("onc"),
+              "input and selection unchanged");
+
+        QWidget layers;
+        layers.setObjectName(QStringLiteral("DockLayers"));
+        PaintProbe layerLabel(&layers);
+        layerLabel.resize(100, 20);
+        g_translateLayersPanel = false;
+        check(layerLabel.probe().isEmpty(), "layers toggle respected by generic paint");
+        g_translateLayersPanel = true;
+        check(layerLabel.probe() == target, "layers paint enabled");
+
+        QComboBox combo(&layers);
+        combo.addItem(source, QStringLiteral("business-id"));
+        QAbstractItemModel *nativeModel = combo.model();
+        const QModelIndex index = nativeModel->index(0, 0);
+        ComboPaintProxyModel proxy(&combo, nullptr);
+        proxy.setSourceModel(nativeModel);
+        check(proxy.index(0, 0).data().toString() == target, "combo presentation translated");
+        check(!proxy.setData(proxy.index(0, 0), target, Qt::EditRole),
+              "display proxy cannot write translated text into the host model");
+        check(proxy.index(0, 0).data(Qt::UserRole).toString() == QStringLiteral("business-id"),
+              "business role preserved");
+        check(combo.currentText() == source && combo.model() == nativeModel,
+              "combo native text and model unchanged");
+        g_translateLayersPanel = false;
+        check(proxy.index(0, 0).data().toString() == source, "combo respects layers toggle");
+        g_translateLayersPanel = true;
+        RecordingDelegate original;
+        ComboPaintDelegate delegate(combo.view(), &combo, &original);
+        QStyleOptionViewItem option;
+        delegate.paint(nullptr, option, index);
+        delegate.sizeHint(option, index);
+        check(original.painted == target && original.measured == target,
+              "paint and size calculation use the same translation");
+        QEvent event(QEvent::User);
+        check(delegate.editorEvent(&event, nativeModel, option, index),
+              "delegate interaction receives real source index");
+        check(original.eventModel == nativeModel, "delegate model preserved");
+        auto *temporaryDelegate = new QStyledItemDelegate;
+        ComboPaintDelegate survivingDelegate(combo.view(), &combo, temporaryDelegate);
+        delete temporaryDelegate;
+        check(survivingDelegate.sizeHint(option, index).isValid(),
+              "destroyed original delegate has a usable Qt fallback");
+        for (int i = 0; i < kGraphCacheLimit + 100; ++i)
+            cacheGraphTranslation(QString::number(i), QString());
+        check(g_fuzzyResolved.size() <= kGraphCacheLimit, "graph cache has a hard bound");
+        sp_delegate_add_translation(L"Concrete", L"混凝土");
+        check(g_fuzzyResolved.isEmpty(), "dictionary update invalidates cached misses");
+
+        Alg::ResourcePickerWidget resourcePicker;
+        Alg::ResourceListView resourceList(&resourcePicker);
+        Alg::SearchFieldLineEdit resourceSearch(&resourcePicker);
+        QStandardItemModel resourceModel;
+        resourceModel.appendRow(new QStandardItem(QStringLiteral("Concrete")));
+        resourceModel.appendRow(new QStandardItem(QStringLiteral("Native hidden")));
+        resourceModel.appendRow(new QStandardItem(QStringLiteral("Other")));
+        resourceList.setModel(&resourceModel);
+        resourceList.setRowHidden(1, true);
+        AssetRowFilter rowFilter;
+        rowFilter.observe(&resourceList);
+        check(resourceList.isRowHidden(1), "binding preserves host-hidden rows");
+        resourceSearch.setText(QStringLiteral("混凝 土"));
+        resourceSearch.setSelection(0, 2);
+        flushSearch();
+        check(!resourceList.isRowHidden(0) && resourceList.isRowHidden(2),
+              "multi-term Chinese search uses each normalized term");
+        check(resourceSearch.text() == QStringLiteral("混凝 土") &&
+              resourceSearch.selectedText() == QStringLiteral("混凝"),
+              "search preserves text and selection");
+        resourceSearch.clear(); flushSearch();
+        check(resourceList.isRowHidden(1) && !resourceList.isRowHidden(2),
+              "clearing search restores only plugin-hidden rows");
+        rowFilter.shutdown();
+        check(resourceList.model() == &resourceModel && resourceList.isRowHidden(1),
+              "search teardown preserves the native model and row state");
+        check(graphHookEnvironmentCompatible(), "compiled Qt major supported");
+        QLabel nativeLabel(source);
+        nativeLabel.resize(180, 30);
+        nativeLabel.show(); app.processEvents();
+        const QImage english = renderWidget(nativeLabel);
+        check(installGraphPainterHooks(), "real QPainter imports mounted");
+        const QImage chinese = renderWidget(nativeLabel);
+        check(chinese != english, "real QLabel render reaches the hook");
+        check(nativeLabel.text() == source, "real hook leaves QLabel source untouched");
+        QGraphicsScene scene;
+        auto *graphLabel = new GraphLabel;
+        scene.addItem(graphLabel);
+        Pfx::Editor::Components::Graph::GraphView graphView;
+        graphView.setScene(&scene);
+        graphView.resize(220, 90);
+        graphView.show(); app.processEvents();
+        g_translateDesignerGraph = false;
+        const QImage graphEnglish = renderWidget(graphView);
+        check(graphLabel->lastTranslation.isEmpty(), "generic hook cannot bypass the graph switch");
+        g_translateDesignerGraph = true;
+        check(renderWidget(graphView) != graphEnglish && graphLabel->lastTranslation == target,
+              "Designer graph adapter paints translations when enabled");
+        g_translateDesignerGraph = false;
+        check(renderWidget(graphView) == graphEnglish, "graph switch restores English pixels");
+        g_translateDesignerGraph = true;
+        graphLabel->source = QStringLiteral("Material …");
+        graphLabel->setToolTip(QStringLiteral("Material One"));
+        auto *otherGraphLabel = new GraphLabel;
+        otherGraphLabel->source = graphLabel->source;
+        otherGraphLabel->setToolTip(QStringLiteral("Material Two"));
+        otherGraphLabel->setPos(190, 0);
+        scene.addItem(otherGraphLabel);
+        graphView.resize(500, 90);
+        g_translations.insert(QStringLiteral("Material One"), QStringLiteral("材质一"));
+        g_translations.insert(QStringLiteral("Material Two"), QStringLiteral("材质二"));
+        renderWidget(graphView);
+        check(graphLabel->lastTranslation == QStringLiteral("材质一") &&
+              otherGraphLabel->lastTranslation == QStringLiteral("材质二"),
+              "same elided title uses each node's own tooltip cache entry");
+        g_translateDesignerGraph = false;
+        auto checkPaint = [&](QWidget &widget, const char *message) {
+            widget.resize(240, 80);
+            widget.show(); app.processEvents();
+            g_enabled = false;
+            const QImage before = renderWidget(widget);
+            g_enabled = true;
+            check(renderWidget(widget) != before, message);
+        };
+        QPushButton button(source);
+        checkPaint(button, "native button paint");
+        check(button.text() == source, "button source preserved");
+        QGroupBox group(source);
+        checkPaint(group, "native group title paint");
+        QTabBar tabs;
+        tabs.addTab(source);
+        tabs.setTabData(0, QStringLiteral("host-owned-payload"));
+        checkPaint(tabs, "native tab paint");
+        check(contextSourceAt(&tabs, tabs.tabRect(0).center()) == source,
+              "translation editor must not interpret host tabData as source");
+        check(tabs.tabData(0).toString() == QStringLiteral("host-owned-payload"),
+              "host tab metadata preserved");
+        QComboBox nativeCombo;
+        nativeCombo.addItem(source);
+        check(paintSource(&nativeCombo, QStringLiteral("Con…")) == source,
+              "elided combo uses its own full source");
+        checkPaint(nativeCombo, "native closed combo paint");
+        check(nativeCombo.currentText() == source, "closed combo source preserved");
+        auto *nativeComboDelegate = nativeCombo.view()->itemDelegate();
+        check(installComboDisplayDelegate(nativeCombo.view(), &nativeCombo) == 1,
+              "standard combo popup delegate supported");
+        check(installComboDisplayDelegate(nativeCombo.view(), &nativeCombo) == 2,
+              "combo attachment is idempotent");
+        restoreComboDisplayDelegates();
+        check(nativeCombo.view()->itemDelegate() == nativeComboDelegate,
+              "native combo delegate restored on teardown");
+        QTabBar ambiguousTabs;
+        ambiguousTabs.addTab(QStringLiteral("Material One"));
+        ambiguousTabs.addTab(QStringLiteral("Material Two"));
+        check(paintSource(&ambiguousTabs, QStringLiteral("Mater…")) == QStringLiteral("Mater…"),
+              "ambiguous tabs must not choose an arbitrary source");
+        QMenu menu;
+        QAction *action = menu.addAction(source);
+        checkPaint(menu, "native menu paint");
+        check(action->text() == source, "menu action source preserved");
+        QLineEdit placeholder;
+        placeholder.setPlaceholderText(source);
+        checkPaint(placeholder, "empty input placeholder paint");
+        check(placeholder.text().isEmpty() && placeholder.placeholderText() == source,
+              "placeholder source and empty value preserved");
+        placeholder.setText(source);
+        g_enabled = false;
+        const QImage inputEnglish = renderWidget(placeholder);
+        g_enabled = true;
+        check(renderWidget(placeholder) == inputEnglish, "entered value never translated");
+        QLabel originalTip(source, nullptr, Qt::ToolTip);
+        originalTip.resize(180, 30);
+        g_enabled = false;
+        const QImage tipEnglish = renderWidget(originalTip);
+        g_enabled = true;
+        check(renderWidget(originalTip) == tipEnglish, "original tooltip never retranslated");
+        PreviewSourceView previewView;
+        QStandardItemModel previewModel;
+        previewModel.appendRow(new QStandardItem(source));
+        previewView.setModel(&previewModel);
+        previewView.show(); app.processEvents();
+        AssetTooltipContext context;
+        context.view = &previewView;
+        context.index = previewModel.index(0, 0);
+        context.source = source;
+        context.translation = target;
+        context.generation = 1;
+        QLabel preview;
+        const QString previewHtml = QStringLiteral("<b>Concrete</b><br/>Native metadata");
+        preview.setText(previewHtml);
+        preview.resize(220, 80);
+        check(injectAssetTranslationIntoLabel(&preview, context, true, QEvent::Show),
+              "asset preview translation prepared");
+        check(preview.text() == previewHtml, "preview HTML remains byte-for-byte unchanged");
+        auto *document = preview.findChild<QTextDocument *>(QStringLiteral("sp_asset_preview_document"));
+        check(document && document->toPlainText().contains(target) &&
+              document->toPlainText().contains(QStringLiteral("Native metadata")),
+              "preview document contains translation and native metadata");
+        const int previewHeight = preview.height();
+        injectAssetTranslationIntoLabel(&preview, context, true, QEvent::Show);
+        check(preview.height() == previewHeight, "preview refresh must not grow repeatedly");
+        restoreAssetTooltipDecoration(&preview);
+        check(!preview.findChild<QTextDocument *>(QStringLiteral("sp_asset_preview_document")),
+              "preview document removed on teardown");
+        g_enabled = false;
+        check(renderWidget(nativeLabel) == english, "real toggle restores English pixels");
+        g_enabled = true;
+        check(uninstallGraphPainterHooks(), "real hooks restored");
+        check(renderWidget(nativeLabel) == english, "unloading restores original paint");
+        g_editDialogOpen = true;
+        check(sp_delegate_uninstall_ui(&app) == 0, "unload refuses active native dialog");
+        g_editDialogOpen = false;
+        check(sp_delegate_uninstall_ui(&app) == 1, "unload acknowledges complete cleanup");
+        check(g_graphHookSlots.empty() && g_hookModuleRefs.empty(), "hook slots and module references released");
+        // Another hook may retain our trampoline. Never report safe unload or
+        // overwrite the third party's pointer in that case.
+        void *originalPointer = reinterpret_cast<void *>(&hookedDrawPoint);
+        void *replacementPointer = reinterpret_cast<void *>(&hookedDrawPointF);
+        void *thirdPartyPointer = reinterpret_cast<void *>(&hookedDrawXY);
+        void *slot = thirdPartyPointer;
+        std::vector<GraphHookSlot> chained{{&slot, originalPointer, replacementPointer}};
+        check(!restoreImportHooks(chained) && slot == thirdPartyPointer,
+              "third-party chained import prevents unsafe unload");
+        slot = replacementPointer;
+        check(restoreImportHooks(chained) && slot == originalPointer, "owned import restores");
+        check(sp_delegate_install_ui(&app) == 1, "engine can be reinstalled");
+        sp_delegate_set_fallback_scan(1);
+        sp_delegate_set_enabled(1);
+        check(g_fallbackTimer->isActive(), "explicit fallback enabled");
+        QListView compactList;
+        compactList.setGridSize(QSize(80, 80));
+        compactList.setWordWrap(false);
+        installAssetDelegate(&compactList, true);
+        check(compactList.gridSize().height() > 80, "compact translation adds label space");
+        sp_delegate_set_enabled(0);
+        check(!g_fallbackTimer->isActive(), "disabled engine stops fallback wakeups");
+        check(compactList.gridSize() == QSize(80, 80) && !compactList.wordWrap(),
+              "disabling restores original resource grid geometry");
+        check(sp_delegate_uninstall_ui(&app) == 1, "second teardown");
+        std::cout << "Display behavior passed on Qt " << qVersion() << '\n';
+    } catch (const std::exception &error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+    return 0;
+}

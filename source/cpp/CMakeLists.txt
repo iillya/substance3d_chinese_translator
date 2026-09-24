@@ -13,7 +13,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 #     at runtime only when the host process is Designer.
 # ---------------------------------------------------------------------------
 function(add_translator_delegate target output_name qt_root qt_major)
-    add_library(${target} SHARED translation_ui_delegate.cpp)
+    if(ARGC GREATER 4 AND ARGV4 STREQUAL "TEST")
+        add_executable(${target} ../tests/display_behavior.cpp)
+        set(fixture_moc "${CMAKE_CURRENT_BINARY_DIR}/${target}_fixtures.cpp")
+        add_custom_command(OUTPUT "${fixture_moc}"
+            COMMAND "${qt_root}/bin/moc.exe"
+                "${CMAKE_CURRENT_SOURCE_DIR}/../tests/host_fixtures.h"
+                -o "${fixture_moc}"
+            DEPENDS ../tests/host_fixtures.h VERBATIM)
+        target_sources(${target} PRIVATE "${fixture_moc}")
+    else()
+        add_library(${target} SHARED translation_ui_delegate.cpp)
+    endif()
     if(SP_TOOLTIP_DIAGNOSTICS)
         target_compile_definitions(${target} PRIVATE
             SD_TRANSLATION_TOOLTIP_DIAGNOSTICS)
@@ -47,21 +58,21 @@ endfunction()
 option(SP_TOOLTIP_DIAGNOSTICS
     "Enable tooltip hook diagnostics for resource hover previews" OFF)
 
-set(QT6_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../_ThirdParty/Qt/6.5.3/msvc2019_64")
+set(QT6_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../_ThirdParty/Qt/6.5.3/msvc2019_64" CACHE PATH "Qt6 SDK root")
 if(NOT EXISTS "${QT6_ROOT}/lib/Qt6Widgets.lib")
-    message(FATAL_ERROR "Bundled Qt6 SDK is missing")
+    message(FATAL_ERROR "Qt6 SDK is missing")
 endif()
 
-# Painter 10.1+ / Qt6. The Qt6 ABI remains compatible across the supported
-# minor versions used by current Painter and Designer releases.
+# Painter 10.1+ / Designer 14+: Qt 6.5 build baseline. Newer compatible
+# runtimes still require host UI behavior validation; ABI alone is not coverage.
 add_translator_delegate(
     translator_delegate_qt6 translator_delegate_qt6 "${QT6_ROOT}" 6)
 
 # Painter 7.2-10.0 / Qt5.12.5. This target is deliberately a separate DLL;
 # loading a Qt6-linked delegate into a Qt5 process is unsafe.
-set(QT5_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../_ThirdParty/Qt/5.12.5/msvc2017_64")
+set(QT5_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../_ThirdParty/Qt/5.12.5/msvc2017_64" CACHE PATH "Qt5 SDK root")
 if(NOT EXISTS "${QT5_ROOT}/lib/Qt5Widgets.lib")
-    message(FATAL_ERROR "Bundled Qt5.12.5 SDK is missing")
+    message(FATAL_ERROR "Qt5 SDK is missing")
 endif()
 add_translator_delegate(
     translator_delegate_qt5 translator_delegate_qt5 "${QT5_ROOT}" 5)
@@ -69,7 +80,10 @@ add_translator_delegate(
 # ---------------------------------------------------------------------------
 # Standalone asset term extractor (shared by both hosts)
 # ---------------------------------------------------------------------------
-set(SP_DEPS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../sdks/deps")
+option(SP_BUILD_EXTRACTOR "Build the standalone resource extractor" ON)
+set(SP_DEPS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../sdks/deps" CACHE PATH
+    "Directory containing extractor headers and static libraries")
+if(SP_BUILD_EXTRACTOR)
 if(NOT EXISTS "${SP_DEPS_ROOT}/lib/archive.lib")
     message(FATAL_ERROR "Bundled extractor dependencies are missing: ${SP_DEPS_ROOT}")
 endif()
@@ -102,4 +116,18 @@ if(MSVC)
         /W4 /WX /utf-8 /permissive- /Zc:__cplusplus)
     set_property(TARGET translator_extractor PROPERTY
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
+endif()
+
+option(SP_BUILD_DISPLAY_TESTS "Build offscreen display behavior tests" OFF)
+if(SP_BUILD_DISPLAY_TESTS)
+    enable_testing()
+    foreach(major IN ITEMS 5 6)
+        set(target display_behavior_qt${major})
+        add_translator_delegate(${target} ${target} "${QT${major}_ROOT}" ${major} TEST)
+        add_test(NAME ${target} COMMAND ${target})
+        set_tests_properties(${target} PROPERTIES ENVIRONMENT
+            "QT_QPA_PLATFORM=offscreen;QT_QPA_FONTDIR=$ENV{WINDIR}/Fonts;QT_PLUGIN_PATH=${QT${major}_ROOT}/plugins;PATH=${QT${major}_ROOT}/bin\;$ENV{PATH}")
+    endforeach()
 endif()

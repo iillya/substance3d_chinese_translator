@@ -47,3 +47,5 @@ source/sp_tools/c++/build/
 # Release artifacts under dist are versioned.
 !/dist/
 !/dist/**
+
+source/cpp/build-*/

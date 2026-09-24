@@ -516,6 +516,7 @@ if HOST == "designer":
 # Designer 生命周期状态（Painter 复用原有的 _label_extractor_* 全局变量）。
 _tool_action = None
 _startup_timer = None
+_update_notification_timer = None
 
 def _read_bool_setting(key, default):
     """Read a boolean without PySide2's unreliable ``type=bool`` overload."""
@@ -662,17 +663,23 @@ def load_translation_packages():
 # On unload the C++ side removes its global filter/timer, restores every host
 # item delegate, and only then releases the DLL reference.
 _native_delegate = None
+_native_unload_safe = False
 
 
 def _load_native_delegate():
-    global _native_delegate
+    global _native_delegate, _native_unload_safe
     if _native_delegate is not None:
         return _native_delegate
 
     path = DELEGATE_DLL_PATH
+    dll = None
     try:
         dll = ctypes.CDLL(path)
+        dll.sp_delegate_api_version.argtypes = []
         dll.sp_delegate_api_version.restype = ctypes.c_int
+        api_version = dll.sp_delegate_api_version()
+        if api_version != 15:
+            raise RuntimeError("原生翻译模块 API 不兼容：需要 15，实际 %s" % api_version)
         dll.sp_delegate_clear_translations.argtypes = []
         dll.sp_delegate_clear_translations.restype = None
         dll.sp_delegate_reserve_translations.argtypes = [ctypes.c_int]
@@ -714,18 +721,17 @@ def _load_native_delegate():
         dll.sp_delegate_install_ui.argtypes = [ctypes.c_void_p]
         dll.sp_delegate_install_ui.restype = ctypes.c_int
         dll.sp_delegate_uninstall_ui.argtypes = [ctypes.c_void_p]
-        dll.sp_delegate_uninstall_ui.restype = None
-        api_version = dll.sp_delegate_api_version()
-        if api_version != 14:
-            print(f">>> 原生翻译模块 API 不兼容：需要 14，实际 {api_version}")
-            return None
+        dll.sp_delegate_uninstall_ui.restype = ctypes.c_int
         dll.sp_delegate_build_id.restype = ctypes.c_wchar_p
         dll.sp_delegate_build_id.argtypes = []
         print(f">>> 原生翻译引擎构建标识：{dll.sp_delegate_build_id()}")
         _native_delegate = dll
+        _native_unload_safe = False
     except Exception as exc:
         print(">>> 原生资源翻译 delegate 加载失败：", exc, sep="")
         _native_delegate = None
+        # No engine entry point has run when signature/API validation fails.
+        _free_native_handle(dll)
     return _native_delegate
 
 
@@ -749,7 +755,7 @@ def _sync_native_dictionary():
     try:
         _apply_dictionary_reload_callback(dll)
         if HOST == "designer":
-            # Always start from an unhooked state; the saved opt-in is applied
+            # Start with graph translation disabled; the saved opt-in is applied
             # only after the UI engine has installed successfully.
             dll.sp_delegate_set_translate_designer_graph(0)
         dll.sp_delegate_clear_translations()
@@ -793,25 +799,25 @@ def _install_native_ui(app):
 
 def _uninstall_native_ui():
     """移除全局事件过滤器和兜底计时器，避免插件关闭后继续拦截宿主事件。"""
+    global _native_unload_safe
     if _native_delegate is None:
-        return
+        return True
+    _native_unload_safe = False
     pointer = 0
     try:
         app = QtWidgets.QApplication.instance()
         if is_safe(app):
             pointer = getCppPointer(app)[0]
-        _native_delegate.sp_delegate_uninstall_ui(
+        _native_unload_safe = _native_delegate.sp_delegate_uninstall_ui(
             ctypes.c_void_p(pointer or 0)
-        )
+        ) == 1
     except Exception as exc:
         print(">>> C++ 界面翻译引擎卸载失败：", exc, sep="")
+    return _native_unload_safe
 
 
-def _release_native_delegate():
-    """释放 Python 对 DLL 的最后引用；C++ 对象已在此前全部撤销。"""
-    global _native_delegate
-    dll = _native_delegate
-    _native_delegate = None
+def _free_native_handle(dll):
+    """Only call for an unused DLL or after confirmed native teardown."""
     handle = getattr(dll, "_handle", 0) if dll is not None else 0
     if handle and os.name == "nt":
         try:
@@ -820,11 +826,28 @@ def _release_native_delegate():
             free_library.restype = ctypes.c_int
             if free_library(ctypes.c_void_p(handle)):
                 dll._handle = 0
+                return True
             else:
                 print(">>> 原生翻译 DLL 释放失败，将由宿主退出时回收")
         except Exception as exc:
             print(">>> 原生翻译 DLL 释放失败：", exc, sep="")
+        return False
+    return True
+
+
+def _release_native_delegate():
+    """Do not unload machine code while any native hook/object may retain it."""
+    global _native_delegate
+    if _native_delegate is None:
+        return True
+    if not _native_unload_safe:
+        print(">>> 原生钩子或对话框尚未完全撤销，保留 DLL，避免卸载后崩溃")
+        return False
+    if not _free_native_handle(_native_delegate):
+        return False
+    _native_delegate = None
     gc.collect()
+    return True
 
 
 def _write_json_atomic(path, payload):
@@ -987,9 +1010,9 @@ class ChineseTranslationToolDialog(QtWidgets.QDialog):
             self.graph_translation_check.setToolTip(
                 _tooltip(
                     "节点标题和端口由 Designer 私有绘制代码生成。"
-                    "启用后仅在通过 Designer/Qt 兼容白名单时，"
-                    "临时挂钩必要的 QPainter 文字绘制入口。"
-                    "关闭后立即回滚挂钩，不修改项目数据。"
+                    "支持 Designer 14 及以上版本，启用前检查 Qt 绘制入口。"
+                    "翻译只作用于绘制出的节点标题和端口。"
+                    "关闭后恢复原文，不修改项目数据。"
                 )
             )
             self.graph_translation_check.toggled.connect(
@@ -1899,8 +1922,8 @@ def _sync_designer_graph_translation():
         )
         if TRANSLATE_DESIGNER_GRAPH and result != 1:
             print(
-                ">>> 节点翻译未启用：Designer/Qt 版本不在"
-                "兼容白名单内，或原生挂钩安装校验失败。"
+                ">>> 节点翻译未启用：Qt 运行库不兼容，"
+                "或绘制入口安装校验失败。"
             )
             return False
         if not TRANSLATE_DESIGNER_GRAPH and result != 1:
@@ -1927,7 +1950,7 @@ def _set_designer_graph_translation(enabled):
         result = QtWidgets.QMessageBox.warning(
             dialog or _get_main_window(),
             "启用节点翻译",
-            "节点翻译需要临时修改 Designer 主程序的 Qt 绘制导入表。\n"
+            "节点标题和端口将通过显示层翻译，不修改节点数据。\n"
             "启用时存在未知风险，"
             "仍要启用吗？",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
@@ -1958,7 +1981,7 @@ def _set_designer_graph_translation(enabled):
         QtWidgets.QMessageBox.warning(
             dialog or _get_main_window(),
             "节点翻译未启用",
-            "当前 Designer/Qt 版本未通过兼容白名单，"
+            "当前 Qt 运行库不兼容，"
             "或挂钩安装校验失败。\n"
             "普通界面翻译不受影响。",
         )
@@ -2071,7 +2094,7 @@ def _clear_native_shortcuts():
         print(">>> 清理快捷键配置失败：", exc, sep="")
 
 
-def _set_translation_enabled(enabled):
+def _set_translation_enabled(enabled, persist=True):
     """Toggle the whole translation engine on/off.
 
     Unchecking the master switch stops translation and restores every
@@ -2079,9 +2102,12 @@ def _set_translation_enabled(enabled):
     """
     global IS_TRANSLATION_ENABLED
     IS_TRANSLATION_ENABLED = bool(enabled)
-    QtCore.QSettings().setValue(
-        "substance3d_chinese_translator/enabled", IS_TRANSLATION_ENABLED
-    )
+    if persist:
+        if is_safe(_startup_timer):
+            _startup_timer.stop()
+        QtCore.QSettings().setValue(
+            "substance3d_chinese_translator/enabled", IS_TRANSLATION_ENABLED
+        )
     _call_native(
         "sp_delegate_set_enabled", int(IS_TRANSLATION_ENABLED),
         label="切换插件翻译总开关",
@@ -2942,9 +2968,13 @@ def _remove_menu_action(action, menu_bar=None):
 
 def _teardown_engine():
     """卸载时的公共清理：原生快捷键、原生引擎、工具面板。"""
-    global IS_APP_QUITTING, IS_CLEANING
+    global IS_APP_QUITTING, IS_CLEANING, _update_notification_timer
     IS_APP_QUITTING = True
     IS_CLEANING = True
+    if is_safe(_update_notification_timer):
+        _update_notification_timer.stop()
+        delete(_update_notification_timer)
+    _update_notification_timer = None
     _clear_native_shortcuts()
     _disable_native_engine()
     _uninstall_native_ui()
@@ -2982,9 +3012,19 @@ def _start_native_engine():
 
 def _schedule_update_notification(main_window):
     """启动 2 秒后提示上次在线更新的结果。"""
-    QtCore.QTimer.singleShot(
-        2000, lambda window=main_window: _notify_update_result(window)
+    global _update_notification_timer
+    if is_safe(_update_notification_timer):
+        _update_notification_timer.stop()
+        delete(_update_notification_timer)
+    _update_notification_timer = QtCore.QTimer(main_window)
+    _update_notification_timer.setSingleShot(True)
+    _update_notification_timer.timeout.connect(
+        lambda window=main_window: (
+            _notify_update_result(window)
+            if not IS_CLEANING and not IS_APP_QUITTING and is_safe(window) else None
+        )
     )
+    _update_notification_timer.start(2000)
 
 
 def _register_tool_action(main_window):
@@ -3019,7 +3059,10 @@ def close_plugin():
 def initializeSDPlugin():
     """Substance 3D Designer 插件入口。"""
     global _tool_action, _startup_timer
-    global IS_APP_QUITTING, IS_CLEANING
+    global IS_APP_QUITTING, IS_CLEANING, IS_TRANSLATION_ENABLED
+
+    if is_safe(_tool_action):
+        return
 
     main_window = _get_main_window()
     if not is_safe(main_window):
@@ -3030,9 +3073,9 @@ def initializeSDPlugin():
     _load_saved_settings()
 
     startup_enabled = IS_TRANSLATION_ENABLED
+    IS_TRANSLATION_ENABLED = False
     _start_native_engine()
-    # Designer 主窗口还在构建中，先禁用翻译，3 秒后自动启用。
-    _set_translation_enabled(False)
+    # Temporary startup suppression must not overwrite the saved preference.
 
     # Designer 菜单栏只保留一个“中文翻译工具”入口；翻译总开关在工具窗口内。
     _tool_action = _register_tool_action(main_window)
@@ -3040,7 +3083,7 @@ def initializeSDPlugin():
     _startup_timer = QtCore.QTimer(main_window)
     _startup_timer.setSingleShot(True)
     _startup_timer.timeout.connect(
-        lambda: _set_translation_enabled(startup_enabled)
+        lambda: _set_translation_enabled(startup_enabled, persist=False)
     )
     _startup_timer.start(3000)
     _apply_shortcuts()
