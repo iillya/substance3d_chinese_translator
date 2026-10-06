@@ -578,6 +578,24 @@ int main(int argc, char **argv) {
         g_translateDesignerGraph = false;
         check(renderWidget(graphView) == graphEnglish, "graph switch restores English pixels");
         g_translateDesignerGraph = true;
+        for (const QString &nativeTitle : {QStringLiteral("原生中文"),
+                                           QStringLiteral("原生 Material")}) {
+            graphLabel->source = nativeTitle;
+            const QImage nativePixels = renderWidget(graphView);
+            check(graphLabel->lastTranslation.isEmpty(),
+                  "unmapped Chinese graph titles remain unchanged");
+            sp_delegate_add_translation(
+                nativeTitle.toStdWString().c_str(), L"自定义节点标题");
+            check(renderWidget(graphView) != nativePixels &&
+                      graphLabel->lastTranslation == QStringLiteral("自定义节点标题"),
+                  "explicit Chinese and mixed graph title overrides affect display");
+            check(graphLabel->source == nativeTitle,
+                  "graph title override leaves the native source unchanged");
+            g_translateDesignerGraph = false;
+            check(renderWidget(graphView) == nativePixels,
+                  "graph switch restores native Chinese title pixels");
+            g_translateDesignerGraph = true;
+        }
         graphLabel->source = QStringLiteral("Material …");
         graphLabel->setToolTip(QStringLiteral("Material One"));
         auto *otherGraphLabel = new GraphLabel;

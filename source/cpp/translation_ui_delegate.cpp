@@ -1807,20 +1807,20 @@ QString graphPaintTranslation(QPainter *painter, const QString &source,
                               GraphPaintContext *context = nullptr) {
     if (!onUiThread() || g_hookDepth > 1 || !g_enabled || !g_translateDesignerGraph)
         return {};
+    if (!isDesignerGraphPainter(painter))
+        return {};
+    // An explicit user mapping also applies to native Chinese or mixed titles.
+    // Only unmatched Chinese text is treated as already translated.
+    QString target = g_translations.value(source);
+    if (!target.isNull())
+        return target;
     // 混合端口标签（已部分翻译 + 残留英文，如"（主要） Preview"）需要
-    // 放行到分段翻译；纯中文标签才是已翻译完成、直接跳过。
+    // 放行到分段翻译；未配置精确词条的中文标签保留原文。
     const bool hasCjk = containsCjk(source);
     const bool mixedPortLabel =
         portSide != 0 && hasCjk && containsAsciiLetter(source);
     if (hasCjk && !mixedPortLabel)
         return {};
-    if (!isDesignerGraphPainter(painter))
-        return {};
-    // 1. Exact dictionary match always wins.
-    QString target = g_translations.value(source);
-    if (!target.isNull())
-        return target;
-
     // 2. Tooltip full-name fallback (node titles only): the graph paints
     // elided titles ("Name …") and identifier forms. The item tooltip carries
     // the full display name on its first line. Port labels must not use this
